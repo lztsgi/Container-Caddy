@@ -1,13 +1,48 @@
-name: Build Caddy Final
+name: Auto Build Caddy
 
+# 触发机制：每天自动检查 + 手动触发
 on:
-  workflow_dispatch:
-  push:
-    tags:
-      - 'v*'
+  schedule:
+    - cron: '0 4 * * *' # 每天凌晨 4 点自动检查一次
+  workflow_dispatch:    # 允许手动点按钮触发
 
 jobs:
+  # 任务 1: 侦察兵 —— 检查是否需要更新
+  check-version:
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.get_version.outputs.version }}
+      skip: ${{ steps.check_release.outputs.skip }}
+    steps:
+      # 1. 获取 Caddy 官方最新版本号
+      - name: Get Upstream Caddy Version
+        id: get_version
+        run: |
+          # 请求 GitHub API 获取 caddyserver/caddy 的最新 release
+          VERSION=$(curl -s https://api.github.com/repos/caddyserver/caddy/releases/latest | grep '"tag_name":' | sed -E 's/.*"([^"]+)".*/\1/')
+          echo "🔍 Official Caddy Version: $VERSION"
+          echo "version=$VERSION" >> $GITHUB_OUTPUT
+
+      # 2. 检查我们自己的仓库是否已经发过这个版本
+      - name: Check Local Release
+        id: check_release
+        run: |
+          VERSION="${{ steps.get_version.outputs.version }}"
+          # 检查当前仓库 release 是否存在
+          HTTP_CODE=$(curl -o /dev/null -s -w "%{http_code}" https://api.github.com/repos/${{ github.repository }}/releases/tags/$VERSION)
+          
+          if [ "$HTTP_CODE" -eq "200" ]; then
+            echo "✅ Release $VERSION already exists. Skipping build."
+            echo "skip=true" >> $GITHUB_OUTPUT
+          else
+            echo "🚀 New version $VERSION detected! Starting build..."
+            echo "skip=false" >> $GITHUB_OUTPUT
+          fi
+
+  # 任务 2: 工兵 —— 执行构建 (只有当 skip != true 时才运行)
   build-and-release:
+    needs: check-version
+    if: needs.check-version.outputs.skip != 'true'
     name: Build ${{ matrix.arch }}
     runs-on: ubuntu-latest
     strategy:
@@ -27,26 +62,27 @@ jobs:
         with:
           go-version: '1.22'
 
-      # 1. 设置 QEMU (关键修复：让 x86 机器能构建 ARM64 镜像)
       - name: Set up QEMU
         uses: docker/setup-qemu-action@v3
 
-      # 2. 设置 Docker Buildx (增强构建工具)
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
 
       - name: Install xcaddy
         run: go install github.com/caddyserver/xcaddy/cmd/xcaddy@latest
 
-      # 3. 编译 Caddy 二进制
+      # 1. 编译 (指定 check-version 获取到的版本号)
       - name: Build Caddy Binary
         run: |
-          GOOS=linux GOARCH=${{ matrix.goarch }} xcaddy build \
+          VERSION="${{ needs.check-version.outputs.version }}"
+          echo "Building Caddy $VERSION for ${{ matrix.arch }}..."
+          
+          GOOS=linux GOARCH=${{ matrix.goarch }} xcaddy build $VERSION \
             --with github.com/caddy-dns/cloudflare \
             --with github.com/mholt/caddy-dynamicdns \
             --output caddy
 
-      # 4. 手动安装 UPX 并压缩
+      # 2. UPX 压缩
       - name: Install and Run UPX
         run: |
           wget https://github.com/upx/upx/releases/download/v4.2.2/upx-4.2.2-amd64_linux.tar.xz
@@ -55,28 +91,21 @@ jobs:
           chmod +x caddy
           upx --best --lzma caddy
 
-      # 5. 准备 Linux 二进制发布文件
+      # 3. 准备文件
       - name: Prepare Binary Asset
         run: |
           cp caddy caddy-linux-${{ matrix.arch }}
 
-      # 6. 构建 Docker 镜像 (现在有了 QEMU，这一步不会再报错了)
+      # 4. 构建 Docker 镜像
       - name: Build Docker Image
         run: |
           docker build --platform linux/${{ matrix.arch }} -t ros-caddy:${{ matrix.arch }} .
 
-      # 7. 导出 Docker 镜像
+      # 5. 导出 Docker 镜像
       - name: Export Docker Image to Tar
         run: |
           docker save -o caddy-docker-${{ matrix.arch }}.tar ros-caddy:${{ matrix.arch }}
 
-      # 8. 上传 Release
-      - name: Upload Release Assets
-        uses: softprops/action-gh-release@v1
-        if: startsWith(github.ref, 'refs/tags/')
-        with:
-          files: |
-            caddy-docker-${{ matrix.arch }}.tar
-            caddy-linux-${{ matrix.arch }}
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      # 6. 发布 Release (全自动打标签)
+      - name: Create Release and Upload
+        uses: soft
