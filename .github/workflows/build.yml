@@ -1,10 +1,49 @@
-name: Force Build Caddy
+name: Caddy Build (ROS & Linux)
 
+# 触发规则：手动强制 + 自动巡逻
 on:
-  workflow_dispatch: # 专门用于手动点按钮触发
+  workflow_dispatch:
+  schedule:
+    - cron: '0 4 * * *' # 每天 UTC 4:00 (北京时间 12:00)
 
 jobs:
+  # 第一步：侦察兵 - 确定版本号
+  check-version:
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.get_version.outputs.version }}
+      do_build: ${{ steps.decision.outputs.do_build }}
+    steps:
+      - name: Get Upstream Version
+        id: get_version
+        run: |
+          # 抓取官方最新 Tag (例如 v2.9.1)
+          VERSION=$(curl -s https://api.github.com/repos/caddyserver/caddy/releases/latest | grep '"tag_name":' | sed -E 's/.*"([^"]+)".*/\1/')
+          echo "🔍 Upstream Version: $VERSION"
+          echo "version=$VERSION" >> $GITHUB_OUTPUT
+
+      - name: Decide Build
+        id: decision
+        run: |
+          VERSION="${{ steps.get_version.outputs.version }}"
+          IS_MANUAL="${{ github.event_name == 'workflow_dispatch' }}"
+          HTTP_CODE=$(curl -o /dev/null -s -w "%{http_code}" https://api.github.com/repos/${{ github.repository }}/releases/tags/$VERSION)
+          
+          if [ "$IS_MANUAL" == "true" ]; then
+            echo "✅ Manual trigger. Forcing build for $VERSION."
+            echo "do_build=true" >> $GITHUB_OUTPUT
+          elif [ "$HTTP_CODE" -ne "200" ]; then
+            echo "🚀 New version $VERSION detected. Building."
+            echo "do_build=true" >> $GITHUB_OUTPUT
+          else
+            echo "💤 Version $VERSION already exists. Skipping."
+            echo "do_build=false" >> $GITHUB_OUTPUT
+          fi
+
+  # 第二步：工兵 - 构建并分流导出
   build-and-release:
+    needs: check-version
+    if: needs.check-version.outputs.do_build == 'true'
     name: Build ${{ matrix.arch }}
     runs-on: ubuntu-latest
     strategy:
@@ -29,53 +68,77 @@ jobs:
 
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
+        with:
+          driver-opts: image=moby/buildkit:latest
 
       - name: Install xcaddy
         run: go install github.com/caddyserver/xcaddy/cmd/xcaddy@latest
 
-      # 1. 直接编译最新稳定版
-      - name: Build Caddy Binary
+      # 1. 核心编译 (一次编译，处处使用)
+      - name: Build & Compress Binary
         run: |
-          GOOS=linux GOARCH=${{ matrix.goarch }} xcaddy build \
+          VERSION="${{ needs.check-version.outputs.version }}"
+          echo "Building Caddy $VERSION..."
+          
+          GOOS=linux GOARCH=${{ matrix.goarch }} xcaddy build $VERSION \
             --with github.com/caddy-dns/cloudflare \
             --with github.com/mholt/caddy-dynamicdns \
             --output caddy
-
-      # 2. 手动安装 UPX 并压缩
-      - name: Install and Run UPX
-        run: |
+          
+          # UPX 压缩
           wget https://github.com/upx/upx/releases/download/v4.2.2/upx-4.2.2-amd64_linux.tar.xz
           tar -xf upx-4.2.2-amd64_linux.tar.xz
           mv upx-4.2.2-amd64_linux/upx /usr/local/bin/upx
           chmod +x caddy
           upx --best --lzma caddy
 
-      # 3. 准备文件
-      - name: Prepare Assets
+      # 2. 准备产物 A：通用 Linux 二进制 (改名区分)
+      - name: Prepare Universal Binary
         run: |
-          cp caddy caddy-linux-${{ matrix.arch }}
+          # 命名格式: caddy-linux-v2.x.x-amd64
+          cp caddy caddy-linux-${{ needs.check-version.outputs.version }}-${{ matrix.arch }}
 
-      # 4. 构建 Docker 镜像
-      - name: Build Docker Image
+      # 3. 准备产物 B：通用 Linux Docker 镜像 (标准构建)
+      - name: Build Universal Docker
         run: |
-          docker build --platform linux/${{ matrix.arch }} -t ros-caddy:${{ matrix.arch }} .
+          VERSION="${{ needs.check-version.outputs.version }}"
+          docker build --platform linux/${{ matrix.arch }} -t caddy-universal:$VERSION .
+          # 导出文件名: caddy-linux-docker-v2.x.x-amd64.tar
+          docker save -o caddy-linux-docker-${VERSION}-${{ matrix.arch }}.tar caddy-universal:$VERSION
 
-      # 5. 导出 Docker 镜像
-      - name: Export Docker Image to Tar
+      # 4. 准备产物 C：RouterOS 专用镜像 (特殊兼容构建)
+      - name: Build RouterOS Docker
         run: |
-          docker save -o caddy-docker-${{ matrix.arch }}.tar ros-caddy:${{ matrix.arch }}
+          VERSION="${{ needs.check-version.outputs.version }}"
+          # 关键参数: --provenance=false (ROS 兼容核心)
+          docker build --platform linux/${{ matrix.arch }} --provenance=false -t caddy-ros:$VERSION .
+          # 导出文件名: caddy-ros-docker-v2.x.x-amd64.tar
+          docker save -o caddy-ros-docker-${VERSION}-${{ matrix.arch }}.tar caddy-ros:$VERSION
 
-      # 6. 发布到 Releases (手动触发时会自动创建一个 'latest' 或以时间命名的标签)
+      # 5. 统一发布
       - name: Upload to Release
         uses: softprops/action-gh-release@v1
         with:
-          tag_name: manual-build-${{ github.run_number }}
-          name: Manual Caddy Build #${{ github.run_number }}
+          tag_name: ${{ needs.check-version.outputs.version }}
+          name: Caddy ${{ needs.check-version.outputs.version }} (All Platforms)
           body: |
-             Manual build triggered by user.
-             Includes: cloudflare, caddy-dynamicdns
+             ## 🚀 Auto Build ${{ needs.check-version.outputs.version }}
+             Includes Plugins: `cloudflare`, `caddy-dynamicdns`
+             
+             ### 📂 File Guide (文件说明):
+             
+             #### 1. RouterOS 专用 (ROS Only)
+             *兼容性优化，不含二进制，仅镜像*
+             - `caddy-ros-docker-...-arm64.tar`: 适用于 N1/树莓派/硬路由 ROS
+             - `caddy-ros-docker-...-amd64.tar`: 适用于 CHR/PVE/ESXi 虚拟机 ROS
+             
+             #### 2. 通用 Linux (Universal Linux)
+             *标准 Docker 镜像 + 独立二进制文件*
+             - `caddy-linux-docker-...tar`: 标准 Docker 导入包
+             - `caddy-linux-...`: 独立可执行文件 (Alpine/Ubuntu 直接运行)
           files: |
-            caddy-docker-${{ matrix.arch }}.tar
-            caddy-linux-${{ matrix.arch }}
+            caddy-linux-${{ needs.check-version.outputs.version }}-${{ matrix.arch }}
+            caddy-linux-docker-${{ needs.check-version.outputs.version }}-${{ matrix.arch }}.tar
+            caddy-ros-docker-${{ needs.check-version.outputs.version }}-${{ matrix.arch }}.tar
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
