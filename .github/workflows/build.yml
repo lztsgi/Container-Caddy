@@ -1,5 +1,4 @@
-name: Caddy Build (Clean & Pure)
-
+name: Caddy Build
 on:
   workflow_dispatch:
   schedule:
