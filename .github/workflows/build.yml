@@ -27,10 +27,18 @@ jobs:
         with:
           go-version: '1.22'
 
+      # 1. 设置 QEMU (关键修复：让 x86 机器能构建 ARM64 镜像)
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@v3
+
+      # 2. 设置 Docker Buildx (增强构建工具)
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
       - name: Install xcaddy
         run: go install github.com/caddyserver/xcaddy/cmd/xcaddy@latest
 
-      # 1. 编译 (xcaddy 默认会自动瘦身，无需干预)
+      # 3. 编译 Caddy 二进制
       - name: Build Caddy Binary
         run: |
           GOOS=linux GOARCH=${{ matrix.goarch }} xcaddy build \
@@ -38,35 +46,31 @@ jobs:
             --with github.com/mholt/caddy-dynamicdns \
             --output caddy
 
-      # 2. 手动安装并运行 UPX (绕过插件的自动 strip 坑)
+      # 4. 手动安装 UPX 并压缩
       - name: Install and Run UPX
         run: |
-          # 下载官方 UPX
           wget https://github.com/upx/upx/releases/download/v4.2.2/upx-4.2.2-amd64_linux.tar.xz
           tar -xf upx-4.2.2-amd64_linux.tar.xz
           mv upx-4.2.2-amd64_linux/upx /usr/local/bin/upx
-          
-          # 赋予权限并压缩
           chmod +x caddy
-          # --best --lzma 提供最高压缩比
           upx --best --lzma caddy
 
-      # 3. 准备 Linux 二进制发布文件
+      # 5. 准备 Linux 二进制发布文件
       - name: Prepare Binary Asset
         run: |
           cp caddy caddy-linux-${{ matrix.arch }}
 
-      # 4. 构建 Docker 镜像
+      # 6. 构建 Docker 镜像 (现在有了 QEMU，这一步不会再报错了)
       - name: Build Docker Image
         run: |
           docker build --platform linux/${{ matrix.arch }} -t ros-caddy:${{ matrix.arch }} .
 
-      # 5. 导出 Docker 镜像
+      # 7. 导出 Docker 镜像
       - name: Export Docker Image to Tar
         run: |
           docker save -o caddy-docker-${{ matrix.arch }}.tar ros-caddy:${{ matrix.arch }}
 
-      # 6. 上传 Release
+      # 8. 上传 Release
       - name: Upload Release Assets
         uses: softprops/action-gh-release@v1
         if: startsWith(github.ref, 'refs/tags/')
