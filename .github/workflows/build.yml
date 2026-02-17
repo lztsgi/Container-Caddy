@@ -1,48 +1,10 @@
-name: Auto Build Caddy
+name: Force Build Caddy
 
-# 触发机制：每天自动检查 + 手动触发
 on:
-  schedule:
-    - cron: '0 4 * * *' # 每天凌晨 4 点自动检查一次
-  workflow_dispatch:    # 允许手动点按钮触发
+  workflow_dispatch: # 专门用于手动点按钮触发
 
 jobs:
-  # 任务 1: 侦察兵 —— 检查是否需要更新
-  check-version:
-    runs-on: ubuntu-latest
-    outputs:
-      version: ${{ steps.get_version.outputs.version }}
-      skip: ${{ steps.check_release.outputs.skip }}
-    steps:
-      # 1. 获取 Caddy 官方最新版本号
-      - name: Get Upstream Caddy Version
-        id: get_version
-        run: |
-          # 请求 GitHub API 获取 caddyserver/caddy 的最新 release
-          VERSION=$(curl -s https://api.github.com/repos/caddyserver/caddy/releases/latest | grep '"tag_name":' | sed -E 's/.*"([^"]+)".*/\1/')
-          echo "🔍 Official Caddy Version: $VERSION"
-          echo "version=$VERSION" >> $GITHUB_OUTPUT
-
-      # 2. 检查我们自己的仓库是否已经发过这个版本
-      - name: Check Local Release
-        id: check_release
-        run: |
-          VERSION="${{ steps.get_version.outputs.version }}"
-          # 检查当前仓库 release 是否存在
-          HTTP_CODE=$(curl -o /dev/null -s -w "%{http_code}" https://api.github.com/repos/${{ github.repository }}/releases/tags/$VERSION)
-          
-          if [ "$HTTP_CODE" -eq "200" ]; then
-            echo "✅ Release $VERSION already exists. Skipping build."
-            echo "skip=true" >> $GITHUB_OUTPUT
-          else
-            echo "🚀 New version $VERSION detected! Starting build..."
-            echo "skip=false" >> $GITHUB_OUTPUT
-          fi
-
-  # 任务 2: 工兵 —— 执行构建 (只有当 skip != true 时才运行)
   build-and-release:
-    needs: check-version
-    if: needs.check-version.outputs.skip != 'true'
     name: Build ${{ matrix.arch }}
     runs-on: ubuntu-latest
     strategy:
@@ -71,18 +33,15 @@ jobs:
       - name: Install xcaddy
         run: go install github.com/caddyserver/xcaddy/cmd/xcaddy@latest
 
-      # 1. 编译 (指定 check-version 获取到的版本号)
+      # 1. 直接编译最新稳定版
       - name: Build Caddy Binary
         run: |
-          VERSION="${{ needs.check-version.outputs.version }}"
-          echo "Building Caddy $VERSION for ${{ matrix.arch }}..."
-          
-          GOOS=linux GOARCH=${{ matrix.goarch }} xcaddy build $VERSION \
+          GOOS=linux GOARCH=${{ matrix.goarch }} xcaddy build \
             --with github.com/caddy-dns/cloudflare \
             --with github.com/mholt/caddy-dynamicdns \
             --output caddy
 
-      # 2. UPX 压缩
+      # 2. 手动安装 UPX 并压缩
       - name: Install and Run UPX
         run: |
           wget https://github.com/upx/upx/releases/download/v4.2.2/upx-4.2.2-amd64_linux.tar.xz
@@ -92,7 +51,7 @@ jobs:
           upx --best --lzma caddy
 
       # 3. 准备文件
-      - name: Prepare Binary Asset
+      - name: Prepare Assets
         run: |
           cp caddy caddy-linux-${{ matrix.arch }}
 
@@ -106,6 +65,17 @@ jobs:
         run: |
           docker save -o caddy-docker-${{ matrix.arch }}.tar ros-caddy:${{ matrix.arch }}
 
-      # 6. 发布 Release (全自动打标签)
-      - name: Create Release and Upload
-        uses: soft
+      # 6. 发布到 Releases (手动触发时会自动创建一个 'latest' 或以时间命名的标签)
+      - name: Upload to Release
+        uses: softprops/action-gh-release@v1
+        with:
+          tag_name: manual-build-${{ github.run_number }}
+          name: Manual Caddy Build #${{ github.run_number }}
+          body: |
+             Manual build triggered by user.
+             Includes: cloudflare, caddy-dynamicdns
+          files: |
+            caddy-docker-${{ matrix.arch }}.tar
+            caddy-linux-${{ matrix.arch }}
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
