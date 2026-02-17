@@ -1,13 +1,11 @@
-name: Caddy Build (ROS & Linux)
+name: Caddy Build (ROS 7.21+ Compatible)
 
-# 触发规则：手动强制 + 自动巡逻
 on:
   workflow_dispatch:
   schedule:
-    - cron: '0 4 * * *' # 每天 UTC 4:00 (北京时间 12:00)
+    - cron: '0 4 * * *'
 
 jobs:
-  # 第一步：侦察兵 - 确定版本号
   check-version:
     runs-on: ubuntu-latest
     outputs:
@@ -17,7 +15,6 @@ jobs:
       - name: Get Upstream Version
         id: get_version
         run: |
-          # 抓取官方最新 Tag (例如 v2.9.1)
           VERSION=$(curl -s https://api.github.com/repos/caddyserver/caddy/releases/latest | grep '"tag_name":' | sed -E 's/.*"([^"]+)".*/\1/')
           echo "🔍 Upstream Version: $VERSION"
           echo "version=$VERSION" >> $GITHUB_OUTPUT
@@ -40,7 +37,6 @@ jobs:
             echo "do_build=false" >> $GITHUB_OUTPUT
           fi
 
-  # 第二步：工兵 - 构建并分流导出
   build-and-release:
     needs: check-version
     if: needs.check-version.outputs.do_build == 'true'
@@ -66,6 +62,7 @@ jobs:
       - name: Set up QEMU
         uses: docker/setup-qemu-action@v3
 
+      # 关键步骤：使用最新的 buildkit 驱动
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
         with:
@@ -74,68 +71,62 @@ jobs:
       - name: Install xcaddy
         run: go install github.com/caddyserver/xcaddy/cmd/xcaddy@latest
 
-      # 1. 核心编译 (一次编译，处处使用)
+      # 1. 编译二进制 (含 UPX 压缩)
       - name: Build & Compress Binary
         run: |
           VERSION="${{ needs.check-version.outputs.version }}"
-          echo "Building Caddy $VERSION..."
-          
           GOOS=linux GOARCH=${{ matrix.goarch }} xcaddy build $VERSION \
             --with github.com/caddy-dns/cloudflare \
             --with github.com/mholt/caddy-dynamicdns \
             --output caddy
           
-          # UPX 压缩
           wget https://github.com/upx/upx/releases/download/v4.2.2/upx-4.2.2-amd64_linux.tar.xz
           tar -xf upx-4.2.2-amd64_linux.tar.xz
           mv upx-4.2.2-amd64_linux/upx /usr/local/bin/upx
           chmod +x caddy
           upx --best --lzma caddy
 
-      # 2. 准备产物 A：通用 Linux 二进制 (改名区分)
-      - name: Prepare Universal Binary
+      # 2. 导出 ROS 专用镜像 (核心修复)
+      - name: Build RouterOS Docker (Force V2 Format)
         run: |
-          # 命名格式: caddy-linux-v2.x.x-amd64
-          cp caddy caddy-linux-${{ needs.check-version.outputs.version }}-${{ matrix.arch }}
+          VERSION="${{ needs.check-version.outputs.version }}"
+          # 这里使用了 --output type=docker
+          # 这是解决 ROS "could not load next layer" 的唯一解法
+          # 它会强制生成 Docker V2 Schema 2 的 tar 包，而非 OCI
+          docker buildx build \
+            --platform linux/${{ matrix.arch }} \
+            --provenance=false \
+            --output type=docker,dest=caddy-ros-docker-${VERSION}-${{ matrix.arch }}.tar \
+            .
 
-      # 3. 准备产物 B：通用 Linux Docker 镜像 (标准构建)
+      # 3. 导出通用 Linux 镜像
       - name: Build Universal Docker
         run: |
           VERSION="${{ needs.check-version.outputs.version }}"
           docker build --platform linux/${{ matrix.arch }} -t caddy-universal:$VERSION .
-          # 导出文件名: caddy-linux-docker-v2.x.x-amd64.tar
           docker save -o caddy-linux-docker-${VERSION}-${{ matrix.arch }}.tar caddy-universal:$VERSION
 
-      # 4. 准备产物 C：RouterOS 专用镜像 (特殊兼容构建)
-      - name: Build RouterOS Docker
-        run: |
-          VERSION="${{ needs.check-version.outputs.version }}"
-          # 关键参数: --provenance=false (ROS 兼容核心)
-          docker build --platform linux/${{ matrix.arch }} --provenance=false -t caddy-ros:$VERSION .
-          # 导出文件名: caddy-ros-docker-v2.x.x-amd64.tar
-          docker save -o caddy-ros-docker-${VERSION}-${{ matrix.arch }}.tar caddy-ros:$VERSION
+      # 4. 准备二进制文件
+      - name: Prepare Binary
+        run: cp caddy caddy-linux-${{ needs.check-version.outputs.version }}-${{ matrix.arch }}
 
-      # 5. 统一发布
+      # 5. 上传所有产物
       - name: Upload to Release
         uses: softprops/action-gh-release@v1
         with:
           tag_name: ${{ needs.check-version.outputs.version }}
-          name: Caddy ${{ needs.check-version.outputs.version }} (All Platforms)
+          name: Caddy ${{ needs.check-version.outputs.version }} (ROS 7.21+ Fix)
           body: |
-             ## 🚀 Auto Build ${{ needs.check-version.outputs.version }}
-             Includes Plugins: `cloudflare`, `caddy-dynamicdns`
+             ## 🚀 Caddy ${{ needs.check-version.outputs.version }}
              
-             ### 📂 File Guide (文件说明):
+             ### ✅ RouterOS 7.21+ 专用 (ROS Users)
+             *格式修复版，解决 `could not load next layer` 报错*
+             - `caddy-ros-docker-...-arm64.tar` (N1/树莓派/硬路由)
+             - `caddy-ros-docker-...-amd64.tar` (X86 虚拟机)
              
-             #### 1. RouterOS 专用 (ROS Only)
-             *兼容性优化，不含二进制，仅镜像*
-             - `caddy-ros-docker-...-arm64.tar`: 适用于 N1/树莓派/硬路由 ROS
-             - `caddy-ros-docker-...-amd64.tar`: 适用于 CHR/PVE/ESXi 虚拟机 ROS
-             
-             #### 2. 通用 Linux (Universal Linux)
-             *标准 Docker 镜像 + 独立二进制文件*
-             - `caddy-linux-docker-...tar`: 标准 Docker 导入包
-             - `caddy-linux-...`: 独立可执行文件 (Alpine/Ubuntu 直接运行)
+             ### 🐧 通用 Linux
+             - `caddy-linux-docker-...tar`
+             - `caddy-linux-...` (二进制)
           files: |
             caddy-linux-${{ needs.check-version.outputs.version }}-${{ matrix.arch }}
             caddy-linux-docker-${{ needs.check-version.outputs.version }}-${{ matrix.arch }}.tar
