@@ -13,10 +13,10 @@ jobs:
     strategy:
       matrix:
         include:
-          - arch: amd64     # Docker 架构名
-            goarch: amd64   # Go 编译架构名
-          - arch: arm64     # Docker 架构名 (RouterOS/N1/树莓派)
-            goarch: arm64   # Go 编译架构名
+          - arch: amd64
+            goarch: amd64
+          - arch: arm64
+            goarch: arm64
 
     steps:
       - name: Checkout code
@@ -30,7 +30,7 @@ jobs:
       - name: Install xcaddy
         run: go install github.com/caddyserver/xcaddy/cmd/xcaddy@latest
 
-      # 1. 编译 (xcaddy 默认会自动带上 -s -w 参数，无需人工干预)
+      # 1. 编译 (xcaddy 默认会自动瘦身，无需干预)
       - name: Build Caddy Binary
         run: |
           GOOS=linux GOARCH=${{ matrix.goarch }} xcaddy build \
@@ -38,29 +38,35 @@ jobs:
             --with github.com/mholt/caddy-dynamicdns \
             --output caddy
 
-      # 2. UPX 极限压缩 (直接压缩，跳过 strip 步骤)
-      - name: Compress with UPX
-        uses: svenstaro/upx-action@v2
-        with:
-          files: caddy
-          args: --best --lzma
+      # 2. 手动安装并运行 UPX (绕过插件的自动 strip 坑)
+      - name: Install and Run UPX
+        run: |
+          # 下载官方 UPX
+          wget https://github.com/upx/upx/releases/download/v4.2.2/upx-4.2.2-amd64_linux.tar.xz
+          tar -xf upx-4.2.2-amd64_linux.tar.xz
+          mv upx-4.2.2-amd64_linux/upx /usr/local/bin/upx
+          
+          # 赋予权限并压缩
+          chmod +x caddy
+          # --best --lzma 提供最高压缩比
+          upx --best --lzma caddy
 
-      # 3. 准备二进制文件 (用于 Alpine 直接部署)
+      # 3. 准备 Linux 二进制发布文件
       - name: Prepare Binary Asset
         run: |
           cp caddy caddy-linux-${{ matrix.arch }}
 
-      # 4. 构建 Docker 镜像 (用于 RouterOS)
+      # 4. 构建 Docker 镜像
       - name: Build Docker Image
         run: |
           docker build --platform linux/${{ matrix.arch }} -t ros-caddy:${{ matrix.arch }} .
 
-      # 5. 导出 Docker 镜像为 .tar
+      # 5. 导出 Docker 镜像
       - name: Export Docker Image to Tar
         run: |
           docker save -o caddy-docker-${{ matrix.arch }}.tar ros-caddy:${{ matrix.arch }}
 
-      # 6. 上传所有资产到 Release
+      # 6. 上传 Release
       - name: Upload Release Assets
         uses: softprops/action-gh-release@v1
         if: startsWith(github.ref, 'refs/tags/')
