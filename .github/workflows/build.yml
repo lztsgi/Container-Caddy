@@ -112,10 +112,6 @@ jobs:
           body: |
              ## 🚀 Caddy ${{ needs.check-version.outputs.version }} (Pure)
              
-             ### ⚠️ 变更说明
-             - **移除了** `caddy-dynamicdns` 插件 (建议使用 ROS 脚本或 Host 网络更新 DDNS)。
-             - **保留了** `cloudflare` 插件 (用于申请通配符 SSL 证书)。
-             
              ### 📂 下载指南
              - **RouterOS 用户**: 请下载 `caddy-ros-docker-...` (已做兼容性处理)。
              - **Linux 用户**: 请下载 `caddy-linux-docker-...` 或二进制文件。
