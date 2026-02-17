@@ -1,4 +1,4 @@
-name: Caddy Build 
+name: Caddy Build + caddy-dynamicdns
 
 on:
   workflow_dispatch:
