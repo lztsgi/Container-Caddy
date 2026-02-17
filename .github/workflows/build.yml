@@ -1,0 +1,75 @@
+name: Build Caddy for RouterOS & Alpine
+
+on:
+  workflow_dispatch:
+  push:
+    tags:
+      - 'v*'
+
+jobs:
+  build-and-release:
+    name: Build ${{ matrix.arch }}
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        include:
+          - arch: amd64     # Docker 架构名
+            goarch: amd64   # Go 编译架构名
+          - arch: arm64     # Docker 架构名 (对应 N1/树莓派/ROS)
+            goarch: arm64   # Go 编译架构名
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: '1.21'
+
+      - name: Install xcaddy
+        run: go install github.com/caddyserver/xcaddy/cmd/xcaddy@latest
+
+      # 1. 编译 (带 Cloudflare 和 DDNS 插件)
+      - name: Build Caddy Binary
+        run: |
+          GOOS=linux GOARCH=${{ matrix.goarch }} xcaddy build \
+            --with github.com/caddy-dns/cloudflare \
+            --with github.com/mholt/caddy-dynamicdns \
+            --output caddy \
+            --go-build-flags="-ldflags '-s -w'"
+
+      # 2. UPX 极限压缩 (二进制文件和 Docker 镜像都会受益)
+      - name: Compress with UPX
+        uses: svenstaro/upx-action@v2
+        with:
+          files: caddy
+          args: --best --lzma
+
+      # 3. 赋予权限并准备二进制发布文件
+      # 我们把 caddy 复制一份改名为 caddy-linux-arm64，用于直接下载部署
+      - name: Prepare Binary Asset
+        run: |
+          chmod +x caddy
+          cp caddy caddy-linux-${{ matrix.arch }}
+
+      # 4. 构建 Docker 镜像 (使用原始名为 caddy 的文件)
+      - name: Build Docker Image
+        run: |
+          docker build --platform linux/${{ matrix.arch }} -t ros-caddy:${{ matrix.arch }} .
+
+      # 5. 导出 Docker 镜像为 .tar
+      - name: Export Docker Image to Tar
+        run: |
+          docker save -o caddy-docker-${{ matrix.arch }}.tar ros-caddy:${{ matrix.arch }}
+
+      # 6. 上传所有资产到 Release (同时上传 .tar 和 二进制)
+      - name: Upload Release Assets
+        uses: softprops/action-gh-release@v1
+        if: startsWith(github.ref, 'refs/tags/')
+        with:
+          files: |
+            caddy-docker-${{ matrix.arch }}.tar
+            caddy-linux-${{ matrix.arch }}
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
