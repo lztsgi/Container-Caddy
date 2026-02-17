@@ -30,7 +30,7 @@ jobs:
       - name: Install xcaddy
         run: go install github.com/caddyserver/xcaddy/cmd/xcaddy@latest
 
-      # 1. 编译 (最稳健方式：不传复杂参数，先编出来再说)
+      # 1. 编译 (xcaddy 默认会自动带上 -s -w 参数，无需人工干预)
       - name: Build Caddy Binary
         run: |
           GOOS=linux GOARCH=${{ matrix.goarch }} xcaddy build \
@@ -38,36 +38,29 @@ jobs:
             --with github.com/mholt/caddy-dynamicdns \
             --output caddy
 
-      # 2. 瘦身第一步：使用 strip 去除符号表 (替代 -ldflags)
-      # 这一步能减少约 20% 体积，且绝对不会报错
-      - name: Strip Debug Symbols
-        run: |
-          chmod +x caddy
-          strip -s caddy
-
-      # 3. 瘦身第二步：UPX 极限压缩
+      # 2. UPX 极限压缩 (直接压缩，跳过 strip 步骤)
       - name: Compress with UPX
         uses: svenstaro/upx-action@v2
         with:
           files: caddy
           args: --best --lzma
 
-      # 4. 准备二进制文件 (用于直接部署)
+      # 3. 准备二进制文件 (用于 Alpine 直接部署)
       - name: Prepare Binary Asset
         run: |
           cp caddy caddy-linux-${{ matrix.arch }}
 
-      # 5. 构建 Docker 镜像
+      # 4. 构建 Docker 镜像 (用于 RouterOS)
       - name: Build Docker Image
         run: |
           docker build --platform linux/${{ matrix.arch }} -t ros-caddy:${{ matrix.arch }} .
 
-      # 6. 导出 Docker 镜像为 .tar (RouterOS 专用)
+      # 5. 导出 Docker 镜像为 .tar
       - name: Export Docker Image to Tar
         run: |
           docker save -o caddy-docker-${{ matrix.arch }}.tar ros-caddy:${{ matrix.arch }}
 
-      # 7. 上传所有资产到 Release
+      # 6. 上传所有资产到 Release
       - name: Upload Release Assets
         uses: softprops/action-gh-release@v1
         if: startsWith(github.ref, 'refs/tags/')
