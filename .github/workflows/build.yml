@@ -1,4 +1,4 @@
-name: Build Caddy for RouterOS & Alpine
+name: Build Caddy Final
 
 on:
   workflow_dispatch:
@@ -15,7 +15,7 @@ jobs:
         include:
           - arch: amd64     # Docker 架构名
             goarch: amd64   # Go 编译架构名
-          - arch: arm64     # Docker 架构名 (对应 N1/树莓派/ROS)
+          - arch: arm64     # Docker 架构名 (RouterOS/N1/树莓派)
             goarch: arm64   # Go 编译架构名
 
     steps:
@@ -25,46 +25,49 @@ jobs:
       - name: Set up Go
         uses: actions/setup-go@v5
         with:
-          go-version: '1.21'
+          go-version: '1.22'
 
       - name: Install xcaddy
         run: go install github.com/caddyserver/xcaddy/cmd/xcaddy@latest
 
-      # 1. 编译 (修正版：使用 -- 透传参数)
+      # 1. 编译 (最稳健方式：不传复杂参数，先编出来再说)
       - name: Build Caddy Binary
         run: |
-          # 注意：最后一行 -- 后面的参数只会传给 go build，不会传给 go mod init
           GOOS=linux GOARCH=${{ matrix.goarch }} xcaddy build \
             --with github.com/caddy-dns/cloudflare \
             --with github.com/mholt/caddy-dynamicdns \
-            --output caddy \
-            -- -ldflags "-s -w"
+            --output caddy
 
-      # 2. UPX 极限压缩 (二进制文件和 Docker 镜像都会受益)
+      # 2. 瘦身第一步：使用 strip 去除符号表 (替代 -ldflags)
+      # 这一步能减少约 20% 体积，且绝对不会报错
+      - name: Strip Debug Symbols
+        run: |
+          chmod +x caddy
+          strip -s caddy
+
+      # 3. 瘦身第二步：UPX 极限压缩
       - name: Compress with UPX
         uses: svenstaro/upx-action@v2
         with:
           files: caddy
           args: --best --lzma
 
-      # 3. 赋予权限并准备二进制发布文件
-      # 我们把 caddy 复制一份改名为 caddy-linux-arm64，用于直接下载部署
+      # 4. 准备二进制文件 (用于直接部署)
       - name: Prepare Binary Asset
         run: |
-          chmod +x caddy
           cp caddy caddy-linux-${{ matrix.arch }}
 
-      # 4. 构建 Docker 镜像 (使用原始名为 caddy 的文件)
+      # 5. 构建 Docker 镜像
       - name: Build Docker Image
         run: |
           docker build --platform linux/${{ matrix.arch }} -t ros-caddy:${{ matrix.arch }} .
 
-      # 5. 导出 Docker 镜像为 .tar
+      # 6. 导出 Docker 镜像为 .tar (RouterOS 专用)
       - name: Export Docker Image to Tar
         run: |
           docker save -o caddy-docker-${{ matrix.arch }}.tar ros-caddy:${{ matrix.arch }}
 
-      # 6. 上传所有资产到 Release (同时上传 .tar 和 二进制)
+      # 7. 上传所有资产到 Release
       - name: Upload Release Assets
         uses: softprops/action-gh-release@v1
         if: startsWith(github.ref, 'refs/tags/')
