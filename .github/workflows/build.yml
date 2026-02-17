@@ -30,14 +30,14 @@ jobs:
       - name: Install xcaddy
         run: go install github.com/caddyserver/xcaddy/cmd/xcaddy@latest
 
-      # 1. 编译 (带 Cloudflare 和 DDNS 插件)
+      # 1. 编译 (修正版：使用 GOFLAGS 环境变量)
       - name: Build Caddy Binary
         run: |
-          GOOS=linux GOARCH=${{ matrix.goarch }} xcaddy build \
+          # 使用 GOFLAGS 传递 -s -w 参数来去除调试信息
+          GOOS=linux GOARCH=${{ matrix.goarch }} GOFLAGS="-ldflags='-s -w'" xcaddy build \
             --with github.com/caddy-dns/cloudflare \
             --with github.com/mholt/caddy-dynamicdns \
-            --output caddy \
-            --go-build-flags="-ldflags '-s -w'"
+            --output caddy
 
       # 2. UPX 极限压缩 (二进制文件和 Docker 镜像都会受益)
       - name: Compress with UPX
