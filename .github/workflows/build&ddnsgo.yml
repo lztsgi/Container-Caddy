@@ -1,0 +1,174 @@
+name: Caddy&DDNSgo Build
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: '0 4 * * *'
+
+jobs:
+  check-version:
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.get_version.outputs.version }}
+      do_build: ${{ steps.decision.outputs.do_build }}
+    steps:
+      - name: Get Upstream Version
+        id: get_version
+        run: |
+          VERSION=$(curl -s https://api.github.com/repos/caddyserver/caddy/releases/latest | grep '"tag_name":' | sed -E 's/.*"([^"]+)".*/\1/')
+          echo "version=$VERSION" >> $GITHUB_OUTPUT
+
+      - name: Decide Build
+        id: decision
+        run: |
+          VERSION="${{ steps.get_version.outputs.version }}"
+          IS_MANUAL="${{ github.event_name == 'workflow_dispatch' }}"
+          HTTP_CODE=$(curl -o /dev/null -s -w "%{http_code}" https://api.github.com/repos/${{ github.repository }}/releases/tags/$VERSION)
+          
+          if [ "$IS_MANUAL" == "true" ]; then
+            echo "do_build=true" >> $GITHUB_OUTPUT
+          elif [ "$HTTP_CODE" -ne "200" ]; then
+            echo "do_build=true" >> $GITHUB_OUTPUT
+          else
+            echo "do_build=false" >> $GITHUB_OUTPUT
+          fi
+
+  build-and-release:
+    needs: check-version
+    if: needs.check-version.outputs.do_build == 'true'
+    name: Build ${{ matrix.arch }}
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        include:
+          - arch: amd64
+            goarch: amd64
+          - arch: arm64
+            goarch: arm64
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: '1.22'
+
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@v3
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Install xcaddy
+        run: go install github.com/caddyserver/xcaddy/cmd/xcaddy@latest
+
+      # 1. 编译 Caddy 二进制 (纯净版)
+      - name: Build & Compress Caddy
+        run: |
+          VERSION="${{ needs.check-version.outputs.version }}"
+          GOOS=linux GOARCH=${{ matrix.goarch }} xcaddy build $VERSION \
+            --with github.com/caddy-dns/cloudflare \
+            --output caddy
+          
+          wget -q https://github.com/upx/upx/releases/download/v4.2.2/upx-4.2.2-amd64_linux.tar.xz
+          tar -xf upx-4.2.2-amd64_linux.tar.xz
+          mv upx-4.2.2-amd64_linux/upx /usr/local/bin/upx
+          chmod +x caddy
+          upx --best --lzma caddy
+
+      # 2. 获取 NewFuture/DDNS 二进制 (Musl版适配Alpine)
+      - name: Download DDNS Binary
+        run: |
+          # 自动匹配 Musl 版本的二进制文件 (musl-linux_amd64 / musl-linux_arm64)
+          DDNS_URL=$(curl -s https://api.github.com/repos/NewFuture/DDNS/releases/latest | grep "browser_download_url" | grep "musl-linux_${{ matrix.goarch }}" | head -n 1 | cut -d '"' -f 4)
+          echo "Downloading DDNS from: $DDNS_URL"
+          wget -q -O ddns "$DDNS_URL"
+          chmod +x ddns
+
+      # 3. 构建 ROS 专用镜像 (Load & Save 兼容模式) - 保持不变
+      - name: Build & Export (ROS Legacy)
+        run: |
+          VERSION="${{ needs.check-version.outputs.version }}"
+          docker buildx build \
+            --platform linux/${{ matrix.arch }} \
+            -t caddy-ros:$VERSION \
+            --load \
+            .
+          docker save -o caddy-ros-docker-${VERSION}-${{ matrix.arch }}.tar caddy-ros:$VERSION
+
+      # 4. 构建通用 Linux 镜像 (Pure) - 保持不变
+      - name: Build Universal Docker (Pure)
+        run: |
+          VERSION="${{ needs.check-version.outputs.version }}"
+          docker build --platform linux/${{ matrix.arch }} -t caddy-universal:$VERSION .
+          docker save -o caddy-linux-docker-${VERSION}-${{ matrix.arch }}.tar caddy-universal:$VERSION
+
+      # 5. 构建带 DDNS 的集成镜像 (新增)
+      - name: Build Caddy with DDNS
+        run: |
+          VERSION="${{ needs.check-version.outputs.version }}"
+          
+          # 生成启动脚本: 如果存在配置文件则后台启动DDNS，然后启动Caddy
+          cat <<EOF > entrypoint_ddns.sh
+          #!/bin/sh
+          if [ -f /config/ddns_config.json ]; then
+            echo "Starting DDNS Service..."
+            /usr/bin/ddns -c /config/ddns_config.json &
+          fi
+          exec caddy run --config /etc/caddy/Caddyfile --adapter caddyfile
+          EOF
+          chmod +x entrypoint_ddns.sh
+
+          # 动态生成 Dockerfile 以包含 DDNS
+          cat <<EOF > Dockerfile.ddns
+          FROM alpine:latest
+          RUN apk add --no-cache ca-certificates tzdata && \
+              cp /usr/share/zoneinfo/Asia/Shanghai /etc/localtime && \
+              echo "Asia/Shanghai" > /etc/timezone && \
+              apk del tzdata && \
+              mkdir -p /config /data /etc/caddy
+          
+          COPY caddy /usr/bin/caddy
+          COPY ddns /usr/bin/ddns
+          COPY entrypoint_ddns.sh /entrypoint.sh
+          
+          ENV XDG_CONFIG_HOME=/config
+          ENV XDG_DATA_HOME=/data
+          
+          EXPOSE 80 443 2019
+          CMD ["/entrypoint.sh"]
+          EOF
+
+          # 构建并导出
+          docker build -f Dockerfile.ddns --platform linux/${{ matrix.arch }} -t caddy-ddns:$VERSION .
+          docker save -o caddy-ddns-docker-${VERSION}-${{ matrix.arch }}.tar caddy-ddns:$VERSION
+
+      # 6. 准备二进制
+      - name: Prepare Binary
+        run: cp caddy caddy-linux-${{ needs.check-version.outputs.version }}-${{ matrix.arch }}
+
+      # 7. 上传
+      - name: Upload to Release
+        uses: softprops/action-gh-release@v1
+        with:
+          tag_name: ${{ needs.check-version.outputs.version }}
+          name: Caddy ${{ needs.check-version.outputs.version }} (Pure & DDNS)
+          body: |
+             ## 🚀 Caddy ${{ needs.check-version.outputs.version }}
+             
+             ### 📂 下载指南
+             - **RouterOS 用户**: 请下载 `caddy-ros-docker-...` (无 DDNS，兼容旧版)。
+             - **Linux (纯净版)**: 请下载 `caddy-linux-docker-...` 或二进制文件。
+             - **Linux (DDNS版)**: 请下载 `caddy-ddns-docker-...` (集成 NewFuture/DDNS)。
+             
+             ### 🛠️ DDNS 版使用说明
+             DDNS 版集成了 [NewFuture/DDNS](https://github.com/NewFuture/DDNS)。
+             如需启用，请挂载配置文件到 `/config/ddns_config.json`。
+          files: |
+            caddy-linux-${{ needs.check-version.outputs.version }}-${{ matrix.arch }}
+            caddy-linux-docker-${{ needs.check-version.outputs.version }}-${{ matrix.arch }}.tar
+            caddy-ros-docker-${{ needs.check-version.outputs.version }}-${{ matrix.arch }}.tar
+            caddy-ddns-docker-${{ needs.check-version.outputs.version }}-${{ matrix.arch }}.tar
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
