@@ -205,7 +205,7 @@ jobs:
           make_latest: true
           allow_updates: true
           body: |
-             ## 📦 Build Summary (Universal & IPv6 Ready)
+             ## 📦 Build Summary (with Cloudflare Plugin)
              - **Caddy**: ${{ needs.check-version.outputs.caddy_ver }}
              - **DDNS-GO**: ${{ needs.check-version.outputs.ddns_ver }}
              
@@ -218,8 +218,8 @@ jobs:
              
              ### 📂 文件列表
              1. `caddy-linux-v...` : 二进制文件
-             2. `caddy-docker-universal-...tar` : 纯净版 Docker (无 DDNS)
-             3. `caddy-ddns-docker-universal-...tar` : 集成版 Docker (含 DDNS + 启动脚本)
+             2. `caddy-docker-universal-...tar` : Docker (无 DDNS)
+             3. `caddy-ddns-docker-universal-...tar` : 集成版 Docker (含 DDNS + 启动等待网卡脚本)
           files: |
             caddy-linux-${{ needs.check-version.outputs.caddy_ver }}-${{ matrix.arch }}
             caddy-docker-universal-${{ needs.check-version.outputs.caddy_ver }}-${{ matrix.arch }}.tar
