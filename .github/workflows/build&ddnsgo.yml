@@ -209,8 +209,8 @@ jobs:
              - **Caddy**: ${{ needs.check-version.outputs.caddy_ver }}
              - **DDNS-GO**: ${{ needs.check-version.outputs.ddns_ver }}
              
-             ### 🛠️ 功能更新
-             1. **ROS/Linux 通用化**: 镜像格式已统一，所有 `.tar` 均可直接导入 RouterOS 7.x 或 `docker load`。
+             ### 🛠️ 功能
+             1. **ROS/Linux 通用化**: 所有 `.tar` 均可直接导入 RouterOS 7.x 或 `docker load`。
              2. **智能网络等待**: DDNS 版镜像支持通过环境变量 `CHECK_MODE` 控制启动等待逻辑。
                 - `CHECK_MODE=ipv6` : 等待 IPv6 Global 地址 (推荐 ROS 用户)
                 - `CHECK_MODE=ipv4` : 等待 IPv4 地址
