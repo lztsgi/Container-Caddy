@@ -42,11 +42,10 @@ jobs:
         with:
           go-version: '1.22'
 
-      # ⚠️ 必须使用 QEMU 以支持多架构构建
       - name: Set up QEMU
         uses: docker/setup-qemu-action@v3
 
-      # ⚠️ [FIX] 新增 Buildx 设置，确保可以使用 --load 参数导出兼容 ROS 的镜像格式
+      # ⚠️ 关键修正：启用 Buildx 以支持 --load (解决 ROS 格式不兼容问题)
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
 
@@ -54,14 +53,13 @@ jobs:
         run: go install github.com/caddyserver/xcaddy/cmd/xcaddy@latest
 
       # ----------------------------------------------------------------
-      # 1. [File 1] 编译 Caddy 二进制 & 准备 DDNS
+      # 1. 编译 Caddy 二进制 (保持不变)
       # ----------------------------------------------------------------
       - name: Build Binary & Prep
         run: |
           CADDY_VER="${{ needs.check-version.outputs.caddy_ver }}"
           DDNS_VER="${{ needs.check-version.outputs.ddns_ver }}"
           
-          # A. 编译 Caddy
           echo ">>> Building Caddy Binary..."
           GOOS=linux GOARCH=${{ matrix.goarch }} xcaddy build $CADDY_VER \
             --with github.com/caddy-dns/cloudflare \
@@ -73,24 +71,21 @@ jobs:
           mv upx-4.2.2-amd64_linux/upx /usr/local/bin/upx
           chmod +x caddy
           upx --best --lzma caddy
-          
-          # 备份二进制 (文件1)
           cp caddy caddy-linux-${CADDY_VER}-${{ matrix.arch }}
 
-          # B. 下载 DDNS-GO
+          # 准备 DDNS-GO
           echo ">>> Downloading DDNS-GO..."
           DDNS_NO_V=$(echo "$DDNS_VER" | sed 's/^v//')
           if [ "${{ matrix.goarch }}" == "amd64" ]; then DDNS_ARCH="x86_64"; else DDNS_ARCH="arm64"; fi
-          
           wget -q "https://github.com/jeessy2/ddns-go/releases/download/${DDNS_VER}/ddns-go_${DDNS_NO_V}_linux_${DDNS_ARCH}.tar.gz"
           tar -zxf "ddns-go_${DDNS_NO_V}_linux_${DDNS_ARCH}.tar.gz"
           mv ddns-go ddns
           chmod +x ddns
 
       # ----------------------------------------------------------------
-      # 2. [File 2 & 3] 构建 Pure Linux & Pure ROS Docker (纯净版)
+      # 2. 构建 Pure Universal Docker (逻辑2：合并 Linux & ROS)
       # ----------------------------------------------------------------
-      - name: Build Pure Docker
+      - name: Build Pure Universal Docker
         run: |
           CADDY_VER="${{ needs.check-version.outputs.caddy_ver }}"
           
@@ -105,70 +100,102 @@ jobs:
           CMD ["caddy", "run", "--config", "/etc/caddy/Caddyfile", "--adapter", "caddyfile"]
           EOF
           
-          # 构建通用镜像
-          # ⚠️ [FIX] 改为 buildx + --load，确保 save 出的文件兼容 ROS
+          # [Fix] 使用 buildx --load 并在导出时使用标准 Docker Tag
+          # 这样生成的 Tar 包既能被 Docker load，也能被 ROS import
           docker buildx build --platform linux/${{ matrix.arch }} -t caddy-pure:latest --load -f Dockerfile.pure .
-          
-          # 导出为通用版 (File 2)
-          docker save -o caddy-linux-docker-${CADDY_VER}-${{ matrix.arch }}.tar caddy-pure:latest
-          
-          # 复制一份作为 ROS 纯净版 (File 3) - 确保文件存在
-          cp caddy-linux-docker-${CADDY_VER}-${{ matrix.arch }}.tar caddy-ros-docker-${CADDY_VER}-${{ matrix.arch }}.tar
+          docker save -o caddy-docker-universal-${CADDY_VER}-${{ matrix.arch }}.tar caddy-pure:latest
 
       # ----------------------------------------------------------------
-      # 3. [File 4] 构建 DDNS ROS Docker (集成版)
+      # 3. 构建 DDNS Universal Docker (逻辑1：环境变量控制检测)
       # ----------------------------------------------------------------
-      - name: Build DDNS Docker
+      - name: Build DDNS Universal Docker
         run: |
           CADDY_VER="${{ needs.check-version.outputs.caddy_ver }}"
           DDNS_VER="${{ needs.check-version.outputs.ddns_ver }}"
           COMBINED_TAG="${CADDY_VER}_ddns-${DDNS_VER}"
           
-          # 启动脚本: 30s 等待 + config.yaml 路径锁定
+          # ⚠️ [Fix] 启动脚本：实现环境变量检测逻辑 + 10分钟等待
           cat <<EOF > entrypoint_ddns.sh
           #!/bin/sh
-          echo ">>> [Init] Waiting for network interface (Max 30s)..."
-          TIMEOUT=30
+          
+          # 读取环境变量，默认为 auto
+          MODE=\${CHECK_MODE:-auto}
+          echo ">>> [Init] Network Check Mode: \$MODE"
+
+          # 辅助函数
+          check_ipv6() { ip -6 addr show scope global | grep -q "inet6"; }
+          check_ipv4() { ip -4 addr show | grep -q "inet"; }
+          check_auto() { ip addr show | grep -q "inet"; }
+
+          # 循环等待 (Max 600s)
+          MAX=60
+          WAIT=10
           COUNT=0
-          while [ \$COUNT -lt \$TIMEOUT ]; do
-             if ip addr show dev eth0 2>/dev/null | grep -q "inet"; then
-                echo ">>> [Init] Network Ready!"
+          
+          while [ \$COUNT -lt \$MAX ]; do
+             READY=0
+             if [ "\$MODE" = "ipv6" ]; then
+                check_ipv6 && READY=1
+             elif [ "\$MODE" = "ipv4" ]; then
+                check_ipv4 && READY=1
+             else
+                check_auto && READY=1
+             fi
+
+             if [ \$READY -eq 1 ]; then
+                echo ">>> [Init] Network Ready (\$MODE)!"
+                if [ "\$MODE" = "ipv6" ]; then ip -6 addr show scope global; fi
                 break
              fi
-             echo ">>> [Init] Waiting for IP..."
-             sleep 1
+             
+             if [ \$((COUNT % 3)) -eq 0 ]; then
+                echo ">>> [Init] Waiting for IP... (\$((COUNT * WAIT))s / 600s)"
+             fi
+             sleep \$WAIT
              COUNT=\$((COUNT+1))
           done
-          
+
+          # 即使超时也尝试启动，避免彻底死锁
+          if [ \$COUNT -eq \$MAX ]; then echo ">>> [WARN] Timeout waiting for IP."; fi
+
+          # 端口清理尝试 (避免 Address in use)
+          if netstat -tulpn 2>/dev/null | grep -q ":80 "; then
+             echo ">>> [WARN] Port 80 busy, waiting 5s..."
+             sleep 5
+          fi
+
           echo ">>> [Step 1] Starting DDNS-GO..."
-          # ⚠️ 锁定配置路径: /etc/ddns-go/config.yaml
+          # 锁定配置路径
           /usr/bin/ddns -l :9876 -f 300 -c /etc/ddns-go/config.yaml 2>&1 &
           
-          echo ">>> [Step 2] Starting Caddy..."
+          echo ">>> [Step 2] Starting Caddy (Delay 2s)..."
+          sleep 2
           exec caddy run --config /etc/caddy/Caddyfile --adapter caddyfile
           EOF
           chmod +x entrypoint_ddns.sh
 
+          # 增加 net-tools 方便调试
           cat <<EOF > Dockerfile.ddns
           FROM alpine:latest
-          RUN apk add --no-cache ca-certificates tzdata iproute2 && \
+          RUN apk add --no-cache ca-certificates tzdata iproute2 net-tools && \
               cp /usr/share/zoneinfo/Asia/Shanghai /etc/localtime && \
               apk del tzdata && mkdir -p /config /data /etc/caddy /etc/ddns-go
           COPY caddy /usr/bin/caddy
           COPY ddns /usr/bin/ddns
           COPY entrypoint_ddns.sh /entrypoint.sh
           ENV XDG_CONFIG_HOME=/config XDG_DATA_HOME=/data
+          # 默认环境变量
+          ENV CHECK_MODE=auto
           EXPOSE 80 443 2019 9876
           CMD ["/entrypoint.sh"]
           EOF
 
-          # 原生构建 + 导出 (File 4)
-          # ⚠️ [FIX] 改为 buildx + --load，确保 save 出的文件兼容 ROS
+          # 构建并导出通用版
           docker buildx build --platform linux/${{ matrix.arch }} -t caddy-ddns:latest --load -f Dockerfile.ddns .
-          docker save -o caddy-ddns-ros-${COMBINED_TAG}-${{ matrix.arch }}.tar caddy-ddns:latest
+          docker save -o caddy-ddns-docker-universal-${COMBINED_TAG}-${{ matrix.arch }}.tar caddy-ddns:latest
 
       # ----------------------------------------------------------------
-      # 4. 强制上传 (Cover 8 Files)
+      # 4. 上传 (文件精简为 3 类)
       # ----------------------------------------------------------------
       - name: Upload to Release
         uses: softprops/action-gh-release@v1
@@ -176,22 +203,26 @@ jobs:
           tag_name: ${{ needs.check-version.outputs.caddy_ver }}
           name: Caddy ${{ needs.check-version.outputs.caddy_ver }}
           make_latest: true
-          # ⚠️ 强制允许更新，解决 "不发布" 问题
           allow_updates: true
           body: |
-             ## 📦 Build Summary (Force Update)
+             ## 📦 Build Summary (Universal & IPv6 Ready)
              - **Caddy**: ${{ needs.check-version.outputs.caddy_ver }}
              - **DDNS-GO**: ${{ needs.check-version.outputs.ddns_ver }}
              
-             ### 📂 包含文件 (共 8 个)
-             1. `caddy-linux-v...` : 二进制
-             2. `caddy-linux-docker-...` : Linux 通用镜像
-             3. `caddy-ros-docker-...` : ROS 纯净镜像
-             4. `caddy-ddns-ros-...` : ROS 集成镜像 (含 DDNS-GO + 30s延时)
+             ### 🛠️ 功能更新
+             1. **ROS/Linux 通用化**: 镜像格式已统一，所有 `.tar` 均可直接导入 RouterOS 7.x 或 `docker load`。
+             2. **智能网络等待**: DDNS 版镜像支持通过环境变量 `CHECK_MODE` 控制启动等待逻辑。
+                - `CHECK_MODE=ipv6` : 等待 IPv6 Global 地址 (推荐 ROS 用户)
+                - `CHECK_MODE=ipv4` : 等待 IPv4 地址
+                - `CHECK_MODE=auto` : 任意 IP 即启动 (默认)
+             
+             ### 📂 文件列表
+             1. `caddy-linux-v...` : 二进制文件
+             2. `caddy-docker-universal-...tar` : 纯净版 Docker (无 DDNS)
+             3. `caddy-ddns-docker-universal-...tar` : 集成版 Docker (含 DDNS + 启动脚本)
           files: |
             caddy-linux-${{ needs.check-version.outputs.caddy_ver }}-${{ matrix.arch }}
-            caddy-linux-docker-${{ needs.check-version.outputs.caddy_ver }}-${{ matrix.arch }}.tar
-            caddy-ros-docker-${{ needs.check-version.outputs.caddy_ver }}-${{ matrix.arch }}.tar
-            caddy-ddns-ros-${{ needs.check-version.outputs.caddy_ver }}_ddns-${{ needs.check-version.outputs.ddns_ver }}-${{ matrix.arch }}.tar
+            caddy-docker-universal-${{ needs.check-version.outputs.caddy_ver }}-${{ matrix.arch }}.tar
+            caddy-ddns-docker-universal-${{ needs.check-version.outputs.caddy_ver }}_ddns-${{ needs.check-version.outputs.ddns_ver }}-${{ matrix.arch }}.tar
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
