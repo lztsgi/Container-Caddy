@@ -46,6 +46,10 @@ jobs:
       - name: Set up QEMU
         uses: docker/setup-qemu-action@v3
 
+      # ⚠️ [FIX] 新增 Buildx 设置，确保可以使用 --load 参数导出兼容 ROS 的镜像格式
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
       - name: Install xcaddy
         run: go install github.com/caddyserver/xcaddy/cmd/xcaddy@latest
 
@@ -102,7 +106,8 @@ jobs:
           EOF
           
           # 构建通用镜像
-          docker build --platform linux/${{ matrix.arch }} -t caddy-pure:latest -f Dockerfile.pure .
+          # ⚠️ [FIX] 改为 buildx + --load，确保 save 出的文件兼容 ROS
+          docker buildx build --platform linux/${{ matrix.arch }} -t caddy-pure:latest --load -f Dockerfile.pure .
           
           # 导出为通用版 (File 2)
           docker save -o caddy-linux-docker-${CADDY_VER}-${{ matrix.arch }}.tar caddy-pure:latest
@@ -158,7 +163,8 @@ jobs:
           EOF
 
           # 原生构建 + 导出 (File 4)
-          docker build --platform linux/${{ matrix.arch }} -t caddy-ddns:latest -f Dockerfile.ddns .
+          # ⚠️ [FIX] 改为 buildx + --load，确保 save 出的文件兼容 ROS
+          docker buildx build --platform linux/${{ matrix.arch }} -t caddy-ddns:latest --load -f Dockerfile.ddns .
           docker save -o caddy-ddns-ros-${COMBINED_TAG}-${{ matrix.arch }}.tar caddy-ddns:latest
 
       # ----------------------------------------------------------------
