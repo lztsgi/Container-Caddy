@@ -1,4 +1,4 @@
-name: Build AdGuardHome PBR for RouterOS
+name: Build-AdGuardHome PBR
 on:
   workflow_dispatch:
   schedule:
