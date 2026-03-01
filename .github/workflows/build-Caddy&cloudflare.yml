@@ -2,7 +2,7 @@ name: Caddy Build
 on:
   workflow_dispatch:
   schedule:
-    - cron: '0 4 * * *'
+    - cron: '0 6 * * *'
 
 jobs:
   check-version:
@@ -87,6 +87,7 @@ jobs:
             --platform linux/${{ matrix.arch }} \
             -t caddy-ros:$VERSION \
             --load \
+            -f docker/caddy-plugins/Dockerfile \
             .
           
           # Save 为标准 Gzip 格式
@@ -96,7 +97,7 @@ jobs:
       - name: Build Universal Docker
         run: |
           VERSION="${{ needs.check-version.outputs.version }}"
-          docker build --platform linux/${{ matrix.arch }} -t caddy-universal:$VERSION .
+          docker build --platform linux/${{ matrix.arch }} -t caddy-universal:$VERSION -f docker/caddy-plugins/Dockerfile .
           docker save -o caddy-linux-docker-${VERSION}-${{ matrix.arch }}.tar caddy-universal:$VERSION
 
       # 4. 准备二进制
