@@ -1,4 +1,4 @@
-name: Caddy Build (Caddy & DDNS-GO)
+name: Build-Caddy&CloudFlare&DDNS-GO
 on:
   workflow_dispatch:
   schedule:
