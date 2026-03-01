@@ -1,0 +1,133 @@
+name: Build AdGuardHome PBR for RouterOS
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: '0 4 * * *'
+
+permissions:
+  contents: write
+
+jobs:
+  check-version:
+    runs-on: ubuntu-latest
+    outputs:
+      ah_ver: ${{ steps.get_versions.outputs.ah_ver }}
+    steps:
+      - name: Get Upstream Version
+        id: get_versions
+        run: |
+          AH_VER=$(curl -s https://api.github.com/repos/AdguardTeam/AdGuardHome/releases/latest | grep '"tag_name":' | sed -E 's/.*"([^"]+)".*/\1/')
+          echo "ah_ver=$AH_VER" >> $GITHUB_OUTPUT
+
+  build-and-release:
+    needs: check-version
+    name: Build ${{ matrix.arch }}
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        include:
+          - arch: amd64
+            ah_arch: amd64
+          - arch: arm64
+            ah_arch: arm64
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@v3
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Download AdGuardHome Binary
+        run: |
+          AH_VER="${{ needs.check-version.outputs.ah_ver }}"
+          wget -q "https://github.com/AdguardTeam/AdGuardHome/releases/download/${AH_VER}/AdGuardHome_linux_${{ matrix.ah_arch }}.tar.gz"
+          tar -zxf "AdGuardHome_linux_${{ matrix.ah_arch }}.tar.gz"
+          mv AdGuardHome/AdGuardHome ./ah-bin
+          chmod +x ./ah-bin
+
+      - name: Prepare Docker Build Files
+        run: |
+          cat <<'EOF' > entrypoint_pbr.sh
+          #!/bin/sh
+          if [ "$ENABLE_PBR" = "true" ]; then
+              echo ">>> [Init] PBR Mode Enabled. Injecting rules..."
+              
+              # 1. 自动寻找网卡（排除 lo 回环），精准适配 ROS 7 的 veth 映射机制
+              LAN_IF=$(ls /sys/class/net | grep -v lo | head -n 1)
+              echo ">>> [Init] Auto-detected Interface: $LAN_IF"
+
+              # 内部策略常量（这三个参数属于底层机制，不需要你通过变量来配）
+              RT_TABLE=100
+              MARK_DEC=53
+              RULE_PREF=10000
+
+              # 2. 修复 BUG: 彻底清空 OUTPUT 链上的旧 mangle 规则，防止重启叠加
+              iptables -t mangle -F OUTPUT 2>/dev/null || true
+
+              # 3. 动态遍历你配置的 LAN_NET 变量下发路由和打标
+              for net in $(env | grep '^LAN_NET' | cut -d= -f2); do
+                  echo ">>> [PBR] Applying routes and mangle for subnet: $net"
+                  ip route replace "$net" via "$GW_IP" dev "$LAN_IF" table "$RT_TABLE" 2>/dev/null
+                  
+                  for proto in udp tcp; do
+                      iptables -t mangle -A OUTPUT -s "${SRC_IP}/32" -d "$net" -p "$proto" --sport 53 -j MARK --set-mark "$MARK_DEC"
+                  done
+              done
+
+              # 4. 挂载总路由规则表
+              if ! ip rule show | grep -q "pref ${RULE_PREF}.*fwmark $(printf '0x%x' $MARK_DEC).*lookup ${RT_TABLE}"; then
+                  ip rule add pref "$RULE_PREF" fwmark "$MARK_DEC" lookup "$RT_TABLE" 2>/dev/null
+              fi
+              ip route flush cache 2>/dev/null
+              echo ">>> [Init] PBR Applied Successfully on $LAN_IF."
+          else
+              echo ">>> [Init] Standard AdGuardHome Mode."
+          fi
+
+          exec /opt/adguardhome/AdGuardHome -h 0.0.0.0 -c /opt/adguardhome/conf/AdGuardHome.yaml -w /opt/adguardhome/work --no-check-update
+          EOF
+          chmod +x entrypoint_pbr.sh
+
+          cat <<'EOF' > Dockerfile.pbr
+          FROM alpine:latest
+          RUN apk add --no-cache ca-certificates tzdata iptables iproute2 && \
+              cp /usr/share/zoneinfo/Asia/Shanghai /etc/localtime && \
+              apk del tzdata && \
+              mkdir -p /opt/adguardhome/conf /opt/adguardhome/work
+          COPY ah-bin /opt/adguardhome/AdGuardHome
+          COPY entrypoint_pbr.sh /entrypoint.sh
+          EXPOSE 53/tcp 53/udp 80/tcp 443/tcp 3000/tcp
+          VOLUME ["/opt/adguardhome/work", "/opt/adguardhome/conf"]
+          CMD ["/entrypoint.sh"]
+          EOF
+
+      - name: Build and Export ROS-compatible Tar
+        run: |
+          AH_VER="${{ needs.check-version.outputs.ah_ver }}"
+          docker buildx build --platform linux/${{ matrix.arch }} -t ah-pbr:latest --load -f Dockerfile.pbr .
+          docker save -o adguardhome-pbr-ros-${AH_VER}-${{ matrix.arch }}.tar ah-pbr:latest
+
+      - name: Upload to Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ needs.check-version.outputs.ah_ver }}
+          name: AdGuardHome PBR ${{ needs.check-version.outputs.ah_ver }}
+          make_latest: true
+          allow_updates: true
+          body: |
+             ## 📦 AdGuardHome for RouterOS (PBR Edition)
+             - **AdGuardHome Version**: ${{ needs.check-version.outputs.ah_ver }}
+             
+             ### 🛠️ 特性更新
+             1. **ROS 兼容导入**: 支持 `.tar` 原生导入。
+             2. **网卡自寻址**: 自动识别 RouterOS 传入的 `veth-xxx` 接口，再也无需手动指定网卡。
+             3. **纯净变量**: 无默认兜底，配置完全由使用者精确控制。
+             4. **去重机制**: 修复了容器软重启导致的 iptables 规则叠加 BUG。
+          files: |
+            adguardhome-pbr-ros-${{ needs.check-version.outputs.ah_ver }}-${{ matrix.arch }}.tar
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
