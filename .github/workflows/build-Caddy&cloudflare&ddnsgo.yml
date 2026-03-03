@@ -82,6 +82,9 @@ jobs:
           tar -zxf "ddns-go_${DDNS_NO_V}_linux_${DDNS_ARCH}.tar.gz"
           mv ddns-go ddns
           chmod +x ddns
+          
+          # ⚠️ 新增：对 DDNS 也进行极限压缩以减小镜像体积
+          upx --best --lzma ddns
 
       # ----------------------------------------------------------------
       # 2. 构建 Pure Universal Docker (逻辑2：合并 Linux & ROS)
@@ -91,7 +94,7 @@ jobs:
           CADDY_VER="${{ needs.check-version.outputs.caddy_ver }}"
           
           # ⚠️ 环境变量配置文件路径 (你可以随时修改这个变量改变挂载读取路径)
-          ENV_FILE_PATH="/root/.env"
+          ENV_FILE_PATH="/etc/caddy/.env"
           
           cat <<EOF > entrypoint_pure.sh
           #!/bin/sh
@@ -150,7 +153,7 @@ jobs:
           MODE=\${CHECK_MODE:-auto}
           echo ">>> [Init] Network Check Mode: \$MODE"
 
-          # 辅助函数
+          # 辅助函数 (使用 Alpine 自带的 ip 指令即可)
           check_ipv6() { ip -6 addr show scope global | grep -q "inet6"; }
           check_ipv4() { ip -4 addr show | grep -q "inet"; }
           check_auto() { ip addr show | grep -q "inet"; }
@@ -202,10 +205,10 @@ jobs:
           EOF
           chmod +x entrypoint_ddns.sh
 
-          # 增加 net-tools 方便调试
+          # 移除臃肿的网络包，保持 Alpine 轻量级优势
           cat <<EOF > Dockerfile.ddns
           FROM alpine:latest
-          RUN apk add --no-cache ca-certificates tzdata iproute2 net-tools && \
+          RUN apk add --no-cache ca-certificates tzdata && \
               cp /usr/share/zoneinfo/Asia/Shanghai /etc/localtime && \
               apk del tzdata && mkdir -p /config /data /etc/caddy /etc/ddns-go
           COPY caddy /usr/bin/caddy
@@ -243,6 +246,7 @@ jobs:
                 - `CHECK_MODE=ipv6` : 等待 IPv6 Global 地址 (推荐 ROS 用户)
                 - `CHECK_MODE=ipv4` : 等待 IPv4 地址
                 - `CHECK_MODE=auto` : 任意 IP 即启动 (默认)
+             3. **文件读取 Token 特性**: 镜像启动时会自动检测并读取 `/etc/caddy/.env` 文件（若存在），支持将含有高敏感信息（如 Cloudflare Token）的环境变量文件进行挂载引用，完美兼容原有环境变量部署方式。
              
              ### 📂 文件列表
              1. `caddy-linux-v...` : 二进制文件
