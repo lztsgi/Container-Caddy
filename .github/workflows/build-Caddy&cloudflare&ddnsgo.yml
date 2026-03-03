@@ -1,4 +1,5 @@
 name: Build-Caddy&CloudFlare&DDNS-GO
+
 on:
   workflow_dispatch:
   schedule:
@@ -89,15 +90,31 @@ jobs:
         run: |
           CADDY_VER="${{ needs.check-version.outputs.caddy_ver }}"
           
+          # ⚠️ 环境变量配置文件路径 (你可以随时修改这个变量改变挂载读取路径)
+          ENV_FILE_PATH="/root/.env"
+          
+          cat <<EOF > entrypoint_pure.sh
+          #!/bin/sh
+          if [ -f "$ENV_FILE_PATH" ]; then
+              echo ">>> [Init] Loading env file from $ENV_FILE_PATH"
+              set -a
+              . "$ENV_FILE_PATH"
+              set +a
+          fi
+          exec caddy run --config /etc/caddy/Caddyfile --adapter caddyfile
+          EOF
+          chmod +x entrypoint_pure.sh
+          
           cat <<EOF > Dockerfile.pure
           FROM alpine:latest
           RUN apk add --no-cache ca-certificates tzdata && \
               cp /usr/share/zoneinfo/Asia/Shanghai /etc/localtime && \
               apk del tzdata && mkdir -p /config /data /etc/caddy
           COPY caddy /usr/bin/caddy
+          COPY entrypoint_pure.sh /entrypoint.sh
           ENV XDG_CONFIG_HOME=/config XDG_DATA_HOME=/data
           EXPOSE 80 443 2019
-          CMD ["caddy", "run", "--config", "/etc/caddy/Caddyfile", "--adapter", "caddyfile"]
+          CMD ["/entrypoint.sh"]
           EOF
           
           # [Fix] 使用 buildx --load 并在导出时使用标准 Docker Tag
@@ -114,9 +131,20 @@ jobs:
           DDNS_VER="${{ needs.check-version.outputs.ddns_ver }}"
           COMBINED_TAG="${CADDY_VER}_ddns-${DDNS_VER}"
           
+          # ⚠️ 环境变量配置文件路径 (你可以随时修改这个变量改变挂载读取路径)
+          ENV_FILE_PATH="/etc/caddy/.env"
+          
           # ⚠️ [Fix] 启动脚本：实现环境变量检测逻辑 + 10分钟等待
           cat <<EOF > entrypoint_ddns.sh
           #!/bin/sh
+          
+          # 检测并加载本地挂载的环境变量文件
+          if [ -f "$ENV_FILE_PATH" ]; then
+              echo ">>> [Init] Loading env file from $ENV_FILE_PATH"
+              set -a
+              . "$ENV_FILE_PATH"
+              set +a
+          fi
           
           # 读取环境变量，默认为 auto
           MODE=\${CHECK_MODE:-auto}
