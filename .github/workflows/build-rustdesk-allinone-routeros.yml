@@ -1,4 +1,4 @@
-name: rustdesk-allinone-routeros-stable
+name: rustdesk-allinone-routeros-auto
 
 on:
   workflow_dispatch:
@@ -30,26 +30,21 @@ jobs:
           echo "api_version=$API_VER" >> $GITHUB_OUTPUT
           echo "web_version=$WEB_VER" >> $GITHUB_OUTPUT
 
-      - name: Generate Dockerfile (Debian Stable)
+      - name: Generate Dockerfile
         run: |
           cat > Dockerfile <<'EOF'
-          # ---- 阶段1: 编译与资源准备 (使用稳定的 Debian 环境) ----
-          FROM golang:1.23-bookworm AS api_builder
-
+          # ---- 阶段1: 编译 API 与 Web ----
+          FROM golang:1.23-alpine AS api_builder
+          
           ARG RUSTDESK_API_REF=master
           ARG RUSTDESK_API_WEB_REF=master
-
-          # 安装 Debian 系的依赖库
-          RUN apt-get update && apt-get install -y --no-install-recommends \
-              git bash ca-certificates tzdata \
-              build-essential libsqlite3-dev \
-              nodejs npm \
-              && rm -rf /var/lib/apt/lists/*
-
+          
+          # Alpine 编译环境所需依赖
+          RUN apk add --no-cache git bash nodejs npm build-base sqlite-dev
+          
           WORKDIR /src
           RUN git clone --depth 1 --branch "${RUSTDESK_API_REF}" https://github.com/lejianwen/rustdesk-api.git .
-
-          # 构建 Web 前端
+          
           RUN set -eux; \
               cd resources; \
               mkdir -p admin; \
@@ -58,8 +53,7 @@ jobs:
               npm ci; \
               npm run build; \
               cp -a dist/* ../admin/
-
-          # 编译 API 主程序 (纯血统 glibc 编译)
+          
           ENV CGO_ENABLED=1 GOOS=linux
           RUN set -eux; \
               mkdir -p /out; \
@@ -70,23 +64,35 @@ jobs:
               cp -a docs /out/docs 2>/dev/null || true; \
               mkdir -p /out/data /out/runtime
 
-          # ---- 阶段2: 最终组装 (官方 Ubuntu/Debian based s6) ----
-          FROM rustdesk/rustdesk-server-s6:latest
+          # ---- 阶段2: 提取官方 S6 及核心组件 ----
+          FROM rustdesk/rustdesk-server-s6:latest AS server
 
-          # 补齐官方基础镜像可能缺失的网络安全依赖
-          RUN apt-get update && apt-get install -y --no-install-recommends \
-              tzdata ca-certificates \
-              && rm -rf /var/lib/apt/lists/*
+          # ---- 阶段3: 最终组装 (基于纯净 Alpine，确保极度稳定) ----
+          FROM alpine:latest
+          
+          # 此时 apk 绝对可用，安装时区和证书
+          RUN apk add --no-cache tzdata ca-certificates
 
+          # 从官方镜像完美移植 S6-overlay 和 RustDesk 核心二进制文件
+          COPY --from=server /init /init
+          COPY --from=server /etc/s6-overlay /etc/s6-overlay
+          COPY --from=server /package /package
+          COPY --from=server /usr/bin/healthcheck.sh /usr/bin/healthcheck.sh
+          COPY --from=server /usr/bin/hbbr /usr/bin/hbbr
+          COPY --from=server /usr/bin/hbbs /usr/bin/hbbs
+          COPY --from=server /usr/bin/rustdesk-utils /usr/bin/rustdesk-utils
+          COPY --from=server /command /command
+
+          # 拷贝我们自己编译的 API
           WORKDIR /app
           COPY --from=api_builder /out/ /app/
 
-          # S6 进程守护 (保留 exec 防止僵尸进程)
+          # 注册 API 的 S6 守护进程 (保留 exec 防止 RouterOS 僵尸进程)
           RUN set -eux; \
               mkdir -p /etc/s6-overlay/s6-rc.d/api; \
               printf "key-secret\nhbbs\n" > /etc/s6-overlay/s6-rc.d/api/dependencies; \
               echo "longrun" > /etc/s6-overlay/s6-rc.d/api/type; \
-              printf "%s\n" "#!/command/with-contenv sh\ncd /app\nexec ./apimain\n" > /etc/s6-overlay/s6-rc.d/api/run; \
+              printf "%s\n" "#!/command/with-contenv sh" "cd /app" "exec ./apimain" > /etc/s6-overlay/s6-rc.d/api/run; \
               chmod +x /etc/s6-overlay/s6-rc.d/api/run; \
               touch /etc/s6-overlay/s6-rc.d/user/contents.d/api; \
               echo "/package/admin/s6/command/s6-svstat /run/s6-rc/servicedirs/api || exit 1" >> /usr/bin/healthcheck.sh; \
@@ -153,7 +159,7 @@ jobs:
         uses: softprops/action-gh-release@v2
         with:
           tag_name: ${{ steps.get_version.outputs.api_version }}
-          name: RustDesk All-in-One ${{ steps.get_version.outputs.api_version }} (Stable Debian Base)
+          name: RustDesk All-in-One ${{ steps.get_version.outputs.api_version }}
           files: |
             ${{ env.IMAGE_NAME }}-${{ steps.get_version.outputs.api_version }}-amd64.tar
             ${{ env.IMAGE_NAME }}-${{ steps.get_version.outputs.api_version }}-arm64.tar
