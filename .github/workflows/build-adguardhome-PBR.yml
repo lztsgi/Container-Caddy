@@ -4,8 +4,10 @@ on:
   schedule:
     - cron: '0 5 * * *'
 
+# ⚠️ 新增：写入 releases 和 packages 的权限
 permissions:
   contents: write
+  packages: write
 
 jobs:
   check-version:
@@ -40,6 +42,14 @@ jobs:
 
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
+
+      # ⚠️ 新增：登录 GitHub Container Registry (用于发布到 Packages)
+      - name: Log in to GitHub Container Registry
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Download AdGuardHome Binary
         run: |
@@ -110,6 +120,14 @@ jobs:
           AH_VER="${{ needs.check-version.outputs.ah_ver }}"
           docker buildx build --platform linux/${{ matrix.arch }} -t ah-pbr:latest --load -f Dockerfile.pbr .
           docker save -o adguardhome-pbr-ros-${AH_VER}-${{ matrix.arch }}.tar ah-pbr:latest
+          
+          # ⚠️ 新增：推送到 GitHub Packages (GHCR)
+          REPO_LOWER=$(echo "${{ github.repository }}" | tr '[:upper:]' '[:lower:]')
+          IMAGE_NAME="ghcr.io/$REPO_LOWER/adguardhome-pbr"
+          docker tag ah-pbr:latest $IMAGE_NAME:${AH_VER}-${{ matrix.arch }}
+          docker tag ah-pbr:latest $IMAGE_NAME:latest-${{ matrix.arch }}
+          docker push $IMAGE_NAME:${AH_VER}-${{ matrix.arch }}
+          docker push $IMAGE_NAME:latest-${{ matrix.arch }}
 
       - name: Upload to Release
         uses: softprops/action-gh-release@v2
@@ -127,6 +145,7 @@ jobs:
              2. **网卡自寻址**: 自动识别 RouterOS 传入的 `veth-xxx` 接口，再也无需手动指定网卡。
              3. **纯净变量**: 无默认兜底，配置完全由使用者精确控制。
              4. **去重机制**: 修复了容器软重启导致的 iptables 规则叠加 BUG。
+             5. **GitHub Packages 支持**: 镜像已同步推送至 `ghcr.io`，支持直接 `docker pull` 拉取 (按对应架构)。
           files: |
             adguardhome-pbr-ros-${{ needs.check-version.outputs.ah_ver }}-${{ matrix.arch }}.tar
         env:
