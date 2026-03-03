@@ -8,6 +8,8 @@ on:
 env:
   # ⚠️ 全局统一：环境变量配置文件路径 (你只需修改这里的路径，下面所有的构建和发布说明都会自动同步)
   ENV_FILE_PATH: "/etc/caddy/env.conf"
+  # ⚠️ 全局统一：默认时区 (若运行时未指定 TZ 环境变量，则默认使用此时间)
+  DEFAULT_TZ: "Asia/Shanghai"
 
 jobs:
   check-version:
@@ -127,11 +129,12 @@ jobs:
           cat <<EOF > Dockerfile.pure
           FROM alpine:latest
           RUN apk add --no-cache ca-certificates tzdata && \
-              cp /usr/share/zoneinfo/Asia/Shanghai /etc/localtime && \
-              apk del tzdata && mkdir -p /config /data /etc/caddy
+              cp /usr/share/zoneinfo/${{ env.DEFAULT_TZ }} /etc/localtime && \
+              echo "${{ env.DEFAULT_TZ }}" > /etc/timezone && \
+              mkdir -p /config /data /etc/caddy
           COPY caddy /usr/bin/caddy
           COPY entrypoint_pure.sh /entrypoint.sh
-          ENV XDG_CONFIG_HOME=/config XDG_DATA_HOME=/data
+          ENV XDG_CONFIG_HOME=/config XDG_DATA_HOME=/data TZ=${{ env.DEFAULT_TZ }}
           EXPOSE 80 443 2019
           CMD ["/entrypoint.sh"]
           EOF
@@ -166,7 +169,7 @@ jobs:
           cat <<EOF > entrypoint_ddns.sh
           #!/bin/sh
           
-          # 检测并加载本地挂载的环境变量文件
+          # 检测并加载本地挂载环境变量文件
           if [ -f "$ENV_FILE_PATH" ]; then
               echo ">>> [Init] Loading env file from $ENV_FILE_PATH"
               set -a
@@ -234,12 +237,13 @@ jobs:
           cat <<EOF > Dockerfile.ddns
           FROM alpine:latest
           RUN apk add --no-cache ca-certificates tzdata && \
-              cp /usr/share/zoneinfo/Asia/Shanghai /etc/localtime && \
-              apk del tzdata && mkdir -p /config /data /etc/caddy /etc/ddns-go
+              cp /usr/share/zoneinfo/${{ env.DEFAULT_TZ }} /etc/localtime && \
+              echo "${{ env.DEFAULT_TZ }}" > /etc/timezone && \
+              mkdir -p /config /data /etc/caddy /etc/ddns-go
           COPY caddy /usr/bin/caddy
           COPY ddns /usr/bin/ddns
           COPY entrypoint_ddns.sh /entrypoint.sh
-          ENV XDG_CONFIG_HOME=/config XDG_DATA_HOME=/data
+          ENV XDG_CONFIG_HOME=/config XDG_DATA_HOME=/data TZ=${{ env.DEFAULT_TZ }}
           # 默认环境变量
           ENV CHECK_MODE=auto
           EXPOSE 80 443 2019 9876
