@@ -58,8 +58,8 @@ jobs:
           RUN set -eux; \
               mkdir -p /out; \
               go mod download; \
-              # 最终环境已是 Alpine，无需静态链接，直接基础编译即可
-              go build -ldflags "-s -w" -o /out/apimain cmd/apimain.go; \
+              # 【修正点】将 cmd/apimain.go 替换为 . 
+              go build -ldflags "-s -w" -o /out/apimain .; \
               cp -a conf /out/conf; \
               cp -a resources /out/resources; \
               cp -a docs /out/docs 2>/dev/null || true; \
@@ -130,7 +130,7 @@ jobs:
           context: .
           file: Dockerfile
           push: true
-          platforms: linux/amd64,linux/arm64
+          platforms: linux/amd64
           build-args: |
             RUSTDESK_API_REF=${{ steps.get_version.outputs.api_version }}
             RUSTDESK_API_WEB_REF=${{ steps.get_version.outputs.web_version }}
