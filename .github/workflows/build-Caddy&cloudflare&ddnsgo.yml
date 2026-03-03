@@ -128,10 +128,14 @@ jobs:
           FROM alpine:latest
           RUN apk add --no-cache ca-certificates tzdata && \
               cp /usr/share/zoneinfo/Asia/Shanghai /etc/localtime && \
-              apk del tzdata && mkdir -p /config /data /etc/caddy
+              echo "Asia/Shanghai" > /etc/timezone && \
+              cp /usr/share/zoneinfo/Asia/Shanghai /tmp/tz && \
+              apk del tzdata && \
+              mkdir -p /usr/share/zoneinfo/Asia /config /data /etc/caddy && \
+              mv /tmp/tz /usr/share/zoneinfo/Asia/Shanghai
           COPY caddy /usr/bin/caddy
           COPY entrypoint_pure.sh /entrypoint.sh
-          ENV XDG_CONFIG_HOME=/config XDG_DATA_HOME=/data
+          ENV XDG_CONFIG_HOME=/config XDG_DATA_HOME=/data TZ=Asia/Shanghai
           EXPOSE 80 443 2019
           CMD ["/entrypoint.sh"]
           EOF
@@ -235,11 +239,15 @@ jobs:
           FROM alpine:latest
           RUN apk add --no-cache ca-certificates tzdata && \
               cp /usr/share/zoneinfo/Asia/Shanghai /etc/localtime && \
-              apk del tzdata && mkdir -p /config /data /etc/caddy /etc/ddns-go
+              echo "Asia/Shanghai" > /etc/timezone && \
+              cp /usr/share/zoneinfo/Asia/Shanghai /tmp/tz && \
+              apk del tzdata && \
+              mkdir -p /usr/share/zoneinfo/Asia /config /data /etc/caddy /etc/ddns-go && \
+              mv /tmp/tz /usr/share/zoneinfo/Asia/Shanghai
           COPY caddy /usr/bin/caddy
           COPY ddns /usr/bin/ddns
           COPY entrypoint_ddns.sh /entrypoint.sh
-          ENV XDG_CONFIG_HOME=/config XDG_DATA_HOME=/data
+          ENV XDG_CONFIG_HOME=/config XDG_DATA_HOME=/data TZ=Asia/Shanghai
           # 默认环境变量
           ENV CHECK_MODE=auto
           EXPOSE 80 443 2019 9876
@@ -269,23 +277,23 @@ jobs:
           make_latest: true
           allow_updates: true
           body: |
-             ## 📦 Build Summary (with Cloudflare Plugin)
-             - **Caddy**: ${{ needs.check-version.outputs.caddy_ver }}
-             - **DDNS-GO**: ${{ needs.check-version.outputs.ddns_ver }}
-             
-             ### 🛠️ 功能
-             1. **ROS/Linux 通用化**: 所有 `.tar` 均可直接导入 RouterOS 7.x 或 `docker load`。
-             2. **GitHub Packages 支持**: 镜像已同步推送至 `ghcr.io`，支持直接 `docker pull` 拉取 (按对应架构)。
-             3. **智能网络等待**: DDNS 版镜像支持通过环境变量 `CHECK_MODE` 控制启动等待逻辑。
-                - `CHECK_MODE=ipv6` : 等待 IPv6 Global 地址 (推荐 ROS 用户)
-                - `CHECK_MODE=ipv4` : 等待 IPv4 地址
-                - `CHECK_MODE=auto` : 任意 IP 即启动 (默认)
-             4. **文件读取 Token 特性**: 镜像启动时会自动检测并读取 `${{ env.ENV_FILE_PATH }}` 文件（若存在），支持将含有高敏感信息（如 Cloudflare Token）的环境变量文件进行挂载引用，完美兼容原有环境变量部署方式。
-             
-             ### 📂 文件列表
-             1. `caddy-linux-v...` : 二进制文件
-             2. `caddy-docker-universal-...tar` : Docker (无 DDNS)
-             3. `caddy-ddns-docker-universal-...tar` : 集成版 Docker (含 DDNS + 启动等待网卡脚本)
+              ## 📦 Build Summary (with Cloudflare Plugin)
+              - **Caddy**: ${{ needs.check-version.outputs.caddy_ver }}
+              - **DDNS-GO**: ${{ needs.check-version.outputs.ddns_ver }}
+              
+              ### 🛠️ 功能
+              1. **ROS/Linux 通用化**: 所有 `.tar` 均可直接导入 RouterOS 7.x 或 `docker load`。
+              2. **GitHub Packages 支持**: 镜像已同步推送至 `ghcr.io`，支持直接 `docker pull` 拉取 (按对应架构)。
+              3. **智能网络等待**: DDNS 版镜像支持通过环境变量 `CHECK_MODE` 控制启动等待逻辑。
+                 - `CHECK_MODE=ipv6` : 等待 IPv6 Global 地址 (推荐 ROS 用户)
+                 - `CHECK_MODE=ipv4` : 等待 IPv4 地址
+                 - `CHECK_MODE=auto` : 任意 IP 即启动 (默认)
+              4. **文件读取 Token 特性**: 镜像启动时会自动检测并读取 `${{ env.ENV_FILE_PATH }}` 文件（若存在），支持将含有高敏感信息（如 Cloudflare Token）的环境变量文件进行挂载引用，完美兼容原有环境变量部署方式。
+              
+              ### 📂 文件列表
+              1. `caddy-linux-v...` : 二进制文件
+              2. `caddy-docker-universal-...tar` : Docker (无 DDNS)
+              3. `caddy-ddns-docker-universal-...tar` : 集成版 Docker (含 DDNS + 启动等待网卡脚本)
           files: |
             caddy-linux-${{ needs.check-version.outputs.caddy_ver }}-${{ matrix.arch }}
             caddy-docker-universal-${{ needs.check-version.outputs.caddy_ver }}-${{ matrix.arch }}.tar
