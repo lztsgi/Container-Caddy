@@ -1,0 +1,153 @@
+name: rustdesk-allinone-routeros
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write
+  packages: write
+
+env:
+  IMAGE_NAME: rustdesk-allinone
+  # 你可以在这里 pin 上游版本（建议用 commit SHA 或 tag，避免 master 漂移）
+  RUSTDESK_API_REF: master
+  RUSTDESK_API_WEB_REF: master
+
+jobs:
+  build-push-and-release:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout (only for workflow context)
+        uses: actions/checkout@v4
+
+      - name: Generate Dockerfile (all-in-one)
+        run: |
+          cat > Dockerfile <<'EOF'
+          # ---- build rustdesk-api from official source ----
+          FROM golang:1.23-alpine AS api_builder
+
+          ARG RUSTDESK_API_REF=master
+          ARG RUSTDESK_API_WEB_REF=master
+
+          # build deps: gcc/musl/sqlite for CGO (sqlite), node/npm for web admin build
+          RUN apk add --no-cache \
+              git bash ca-certificates tzdata \
+              build-base sqlite-dev \
+              nodejs npm
+
+          WORKDIR /src
+          RUN git clone --depth 1 --branch "${RUSTDESK_API_REF}" https://github.com/lejianwen/rustdesk-api.git .
+
+          # Build web admin frontend into resources/admin (as README describes)
+          # README 的源码安装步骤要求从 rustdesk-api-web 构建并拷入 resources/admin :contentReference[oaicite:2]{index=2}
+          RUN set -eux; \
+              cd resources; \
+              mkdir -p admin; \
+              git clone --depth 1 --branch "${RUSTDESK_API_WEB_REF}" https://github.com/lejianwen/rustdesk-api-web.git; \
+              cd rustdesk-api-web; \
+              npm ci; \
+              npm run build; \
+              cp -a dist/* ../admin/
+
+          # Build apimain + bundle conf/resources/docs like build.sh does (but skip swag generation)
+          ENV CGO_ENABLED=1 GOOS=linux
+          RUN set -eux; \
+              mkdir -p /out; \
+              go mod download; \
+              go build -o /out/apimain cmd/apimain.go; \
+              cp -a conf /out/conf; \
+              cp -a resources /out/resources; \
+              cp -a docs /out/docs 2>/dev/null || true; \
+              mkdir -p /out/data /out/runtime
+
+          # ---- final: extend rustdesk-server-s6, add api as s6 service ----
+          FROM rustdesk/rustdesk-server-s6:latest
+
+          # keep it minimal; tzdata for TZ env, ca-certs for outbound https (oauth/oidc etc.)
+          RUN apk add --no-cache tzdata ca-certificates
+
+          WORKDIR /app
+          COPY --from=api_builder /out/ /app/
+
+          # Register "api" service into s6-rc (pattern from upstream Dockerfile_full_s6) :contentReference[oaicite:3]{index=3}
+          RUN set -eux; \
+              mkdir -p /etc/s6-overlay/s6-rc.d/api; \
+              printf "key-secret\nhbbs\n" > /etc/s6-overlay/s6-rc.d/api/dependencies; \
+              echo "longrun" > /etc/s6-overlay/s6-rc.d/api/type; \
+              printf "%s\n" "#!/command/with-contenv sh" "cd /app" "./apimain" > /etc/s6-overlay/s6-rc.d/api/run; \
+              chmod +x /etc/s6-overlay/s6-rc.d/api/run; \
+              touch /etc/s6-overlay/s6-rc.d/user/contents.d/api; \
+              # healthcheck: ensure api is up (append check like upstream) :contentReference[oaicite:4]{index=4}
+              echo "/package/admin/s6/command/s6-svstat /run/s6-rc/servicedirs/api || exit 1" >> /usr/bin/healthcheck.sh; \
+              ln -sf /run /var/run
+
+          # Volumes: /data for rustdesk-server keys; /app/data for rustdesk-api sqlite
+          VOLUME /data
+          VOLUME /app/data
+
+          # Ports: rustdesk-server + api
+          EXPOSE 21114 21115 21116 21116/udp 21117 21118 21119
+
+          # Defaults (can be overridden)
+          ENV RELAY=relay.example.com \
+              ENCRYPTED_ONLY=0 \
+              TZ=Asia/Shanghai
+
+          ENTRYPOINT ["/init"]
+          EOF
+
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@v3
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Login to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build & push multi-arch image to GHCR
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: Dockerfile
+          push: true
+          platforms: linux/amd64,linux/arm64
+          build-args: |
+            RUSTDESK_API_REF=${{ env.RUSTDESK_API_REF }}
+            RUSTDESK_API_WEB_REF=${{ env.RUSTDESK_API_WEB_REF }}
+          tags: |
+            ghcr.io/${{ github.repository_owner }}/${{ env.IMAGE_NAME }}:${{ github.ref_name }}
+            ghcr.io/${{ github.repository_owner }}/${{ env.IMAGE_NAME }}:latest
+
+      # RouterOS 官方导入路径是“save 成 tar，再 /container/add file= 导入” :contentReference[oaicite:5]{index=5}
+      # 同时社区经验里：buildx --output 直出 tar 可能不兼容，建议 build 到本地再 docker save :contentReference[oaicite:6]{index=6}
+      - name: Build amd64 image (local) and docker save
+        run: |
+          docker buildx build --platform linux/amd64 --load \
+            -f Dockerfile \
+            --build-arg RUSTDESK_API_REF=${RUSTDESK_API_REF} \
+            --build-arg RUSTDESK_API_WEB_REF=${RUSTDESK_API_WEB_REF} \
+            -t ${IMAGE_NAME}:${GITHUB_REF_NAME}-amd64 .
+          docker save ${IMAGE_NAME}:${GITHUB_REF_NAME}-amd64 -o ${IMAGE_NAME}-${GITHUB_REF_NAME}-amd64.tar
+
+      - name: Build arm64 image (local) and docker save
+        run: |
+          docker buildx build --platform linux/arm64 --load \
+            -f Dockerfile \
+            --build-arg RUSTDESK_API_REF=${RUSTDESK_API_REF} \
+            --build-arg RUSTDESK_API_WEB_REF=${RUSTDESK_API_WEB_REF} \
+            -t ${IMAGE_NAME}:${GITHUB_REF_NAME}-arm64 .
+          docker save ${IMAGE_NAME}:${GITHUB_REF_NAME}-arm64 -o ${IMAGE_NAME}-${GITHUB_REF_NAME}-arm64.tar
+
+      - name: Create/Update GitHub Release and upload RouterOS tar assets
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            ${{ env.IMAGE_NAME }}-${{ github.ref_name }}-amd64.tar
+            ${{ env.IMAGE_NAME }}-${{ github.ref_name }}-arm64.tar
