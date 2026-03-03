@@ -1,0 +1,147 @@
+name: Build-Caddy&cloudflare
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: '0 6 * * *'
+
+jobs:
+  check-version:
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.get_version.outputs.version }}
+      do_build: ${{ steps.decision.outputs.do_build }}
+    steps:
+      - name: Get Upstream Version
+        id: get_version
+        run: |
+          VERSION=$(curl -s https://api.github.com/repos/caddyserver/caddy/releases/latest | grep '"tag_name":' | sed -E 's/.*"([^"]+)".*/\1/')
+          echo "version=$VERSION" >> $GITHUB_OUTPUT
+
+      - name: Decide Build
+        id: decision
+        run: |
+          VERSION="${{ steps.get_version.outputs.version }}"
+          IS_MANUAL="${{ github.event_name == 'workflow_dispatch' }}"
+          HTTP_CODE=$(curl -o /dev/null -s -w "%{http_code}" https://api.github.com/repos/${{ github.repository }}/releases/tags/$VERSION)
+          
+          if [ "$IS_MANUAL" == "true" ]; then
+            echo "do_build=true" >> $GITHUB_OUTPUT
+          elif [ "$HTTP_CODE" -ne "200" ]; then
+            echo "do_build=true" >> $GITHUB_OUTPUT
+          else
+            echo "do_build=false" >> $GITHUB_OUTPUT
+          fi
+
+  build-and-release:
+    needs: check-version
+    if: needs.check-version.outputs.do_build == 'true'
+    name: Build ${{ matrix.arch }}
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        include:
+          - arch: amd64
+            goarch: amd64
+          - arch: arm64
+            goarch: arm64
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: '1.22'
+
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@v3
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Install xcaddy
+        run: go install github.com/caddyserver/xcaddy/cmd/xcaddy@latest
+
+      # 1. 编译二进制 (移除 DDNS 插件，保留 Cloudflare DNS 用于证书)
+      - name: Build & Compress Binary
+        run: |
+          VERSION="${{ needs.check-version.outputs.version }}"
+          GOOS=linux GOARCH=${{ matrix.goarch }} xcaddy build $VERSION \
+            --with github.com/caddy-dns/cloudflare \
+            --output caddy
+          
+          wget https://github.com/upx/upx/releases/download/v4.2.2/upx-4.2.2-amd64_linux.tar.xz
+          tar -xf upx-4.2.2-amd64_linux.tar.xz
+          mv upx-4.2.2-amd64_linux/upx /usr/local/bin/upx
+          chmod +x caddy
+          upx --best --lzma caddy
+
+      # 2. 构建 ROS 专用镜像 (Load & Save 兼容模式)
+      - name: Build & Export (Legacy Mode)
+        run: |
+          VERSION="${{ needs.check-version.outputs.version }}"
+          
+          # ⚠️ 环境变量配置文件路径 (你可以随时修改这个变量改变挂载读取路径)
+          ENV_FILE_PATH="/root/.env"
+          
+          # 动态注入环境变量挂载支持脚本
+          cat <<EOF > entrypoint_wrapper.sh
+          #!/bin/sh
+          if [ -f "$ENV_FILE_PATH" ]; then
+              echo ">>> [Init] Loading env file from $ENV_FILE_PATH"
+              set -a
+              . "$ENV_FILE_PATH"
+              set +a
+          fi
+          # 默认执行 Caddy
+          exec caddy run --config /etc/caddy/Caddyfile --adapter caddyfile
+          EOF
+          chmod +x entrypoint_wrapper.sh
+          
+          # 动态修改源码库中的 Dockerfile 以加载 wrapper
+          echo "COPY entrypoint_wrapper.sh /entrypoint.sh" >> docker/caddy-plugins/Dockerfile
+          echo 'ENTRYPOINT ["/entrypoint.sh"]' >> docker/caddy-plugins/Dockerfile
+          
+          # Load 到 Docker Daemon 进行格式清洗
+          docker buildx build \
+            --platform linux/${{ matrix.arch }} \
+            -t caddy-ros:$VERSION \
+            --load \
+            -f docker/caddy-plugins/Dockerfile \
+            .
+          
+          # Save 为标准 Gzip 格式
+          docker save -o caddy-ros-docker-${VERSION}-${{ matrix.arch }}.tar caddy-ros:$VERSION
+
+      # 3. 构建通用 Linux 镜像
+      - name: Build Universal Docker
+        run: |
+          VERSION="${{ needs.check-version.outputs.version }}"
+          docker build --platform linux/${{ matrix.arch }} -t caddy-universal:$VERSION -f docker/caddy-plugins/Dockerfile .
+          docker save -o caddy-linux-docker-${VERSION}-${{ matrix.arch }}.tar caddy-universal:$VERSION
+
+      # 4. 准备二进制
+      - name: Prepare Binary
+        run: cp caddy caddy-linux-${{ needs.check-version.outputs.version }}-${{ matrix.arch }}
+
+      # 5. 上传
+      - name: Upload to Release
+        uses: softprops/action-gh-release@v1
+        with:
+          tag_name: ${{ needs.check-version.outputs.version }}
+          name: Caddy ${{ needs.check-version.outputs.version }} (Pure Edition)
+          body: |
+             ## 🚀 Caddy ${{ needs.check-version.outputs.version }} (Pure)
+             
+             ### 📂 下载指南
+             - **RouterOS 用户**: 请下载 `caddy-ros-docker-...` (已做兼容性处理)。
+             - **Linux 用户**: 请下载 `caddy-linux-docker-...` 或二进制文件。
+             - **文件读取 Token 特性**: 镜像启动时会自动检测并读取 `/root/.env` 文件（若存在），支持将含有高敏感信息（如 Cloudflare Token）的环境变量文件进行挂载引用，完美兼容原有环境变量部署方式。
+          files: |
+            caddy-linux-${{ needs.check-version.outputs.version }}-${{ matrix.arch }}
+            caddy-linux-docker-${{ needs.check-version.outputs.version }}-${{ matrix.arch }}.tar
+            caddy-ros-docker-${{ needs.check-version.outputs.version }}-${{ matrix.arch }}.tar
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
