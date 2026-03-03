@@ -135,7 +135,7 @@ jobs:
           COMBINED_TAG="${CADDY_VER}_ddns-${DDNS_VER}"
           
           # ⚠️ 环境变量配置文件路径 (你可以随时修改这个变量改变挂载读取路径)
-          ENV_FILE_PATH="/etc/caddy/.env"
+          ENV_FILE_PATH="/etc/caddy/env.conf"
           
           # ⚠️ [Fix] 启动脚本：实现环境变量检测逻辑 + 10分钟等待
           cat <<EOF > entrypoint_ddns.sh
@@ -246,7 +246,7 @@ jobs:
                 - `CHECK_MODE=ipv6` : 等待 IPv6 Global 地址 (推荐 ROS 用户)
                 - `CHECK_MODE=ipv4` : 等待 IPv4 地址
                 - `CHECK_MODE=auto` : 任意 IP 即启动 (默认)
-             3. **文件读取 Token 特性**: 镜像启动时会自动检测并读取 `/root/.env` 文件（若存在），支持将含有高敏感信息（如 Cloudflare Token）的环境变量文件进行挂载引用，完美兼容原有环境变量部署方式。
+             3. **文件读取 Token 特性**: 镜像启动时会自动检测并读取 `/etc/caddy/env.conf` 文件（若存在），支持将含有高敏感信息（如 Cloudflare Token）的环境变量文件进行挂载引用，完美兼容原有环境变量部署方式。
              
              ### 📂 文件列表
              1. `caddy-linux-v...` : 二进制文件
