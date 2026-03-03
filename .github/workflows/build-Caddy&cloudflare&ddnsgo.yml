@@ -5,6 +5,10 @@ on:
   schedule:
     - cron: '0 4 * * *'
 
+env:
+  # ⚠️ 全局统一：环境变量配置文件路径 (你只需修改这里的路径，下面所有的构建和发布说明都会自动同步)
+  ENV_FILE_PATH: "/etc/caddy/env.conf"
+
 jobs:
   check-version:
     runs-on: ubuntu-latest
@@ -26,6 +30,10 @@ jobs:
     needs: check-version
     name: Build ${{ matrix.arch }}
     runs-on: ubuntu-latest
+    # ⚠️ 新增：赋予推送 Packages 和 Releases 的权限
+    permissions:
+      contents: write
+      packages: write
     strategy:
       matrix:
         include:
@@ -49,6 +57,14 @@ jobs:
       # ⚠️ 关键修正：启用 Buildx 以支持 --load (解决 ROS 格式不兼容问题)
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
+
+      # ⚠️ 新增：登录 GitHub Container Registry (用于发布到 Packages)
+      - name: Log in to GitHub Container Registry
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Install xcaddy
         run: go install github.com/caddyserver/xcaddy/cmd/xcaddy@latest
@@ -93,8 +109,8 @@ jobs:
         run: |
           CADDY_VER="${{ needs.check-version.outputs.caddy_ver }}"
           
-          # ⚠️ 环境变量配置文件路径 (你可以随时修改这个变量改变挂载读取路径)
-          ENV_FILE_PATH="/root/.env"
+          # ⚠️ 环境变量配置文件路径 (已统一在顶部 env 中定义)
+          ENV_FILE_PATH="${{ env.ENV_FILE_PATH }}"
           
           cat <<EOF > entrypoint_pure.sh
           #!/bin/sh
@@ -124,6 +140,15 @@ jobs:
           # 这样生成的 Tar 包既能被 Docker load，也能被 ROS import
           docker buildx build --platform linux/${{ matrix.arch }} -t caddy-pure:latest --load -f Dockerfile.pure .
           docker save -o caddy-docker-universal-${CADDY_VER}-${{ matrix.arch }}.tar caddy-pure:latest
+          
+          # ⚠️ 新增：推送到 GitHub Packages (GHCR)
+          # 将拥有者名称转为小写，符合 GHCR 规范
+          REPO_LOWER=$(echo "${{ github.repository }}" | tr '[:upper:]' '[:lower:]')
+          PURE_IMAGE="ghcr.io/$REPO_LOWER/caddy-pure"
+          docker tag caddy-pure:latest $PURE_IMAGE:${CADDY_VER}-${{ matrix.arch }}
+          docker tag caddy-pure:latest $PURE_IMAGE:latest-${{ matrix.arch }}
+          docker push $PURE_IMAGE:${CADDY_VER}-${{ matrix.arch }}
+          docker push $PURE_IMAGE:latest-${{ matrix.arch }}
 
       # ----------------------------------------------------------------
       # 3. 构建 DDNS Universal Docker (逻辑1：环境变量控制检测)
@@ -134,8 +159,8 @@ jobs:
           DDNS_VER="${{ needs.check-version.outputs.ddns_ver }}"
           COMBINED_TAG="${CADDY_VER}_ddns-${DDNS_VER}"
           
-          # ⚠️ 环境变量配置文件路径 (你可以随时修改这个变量改变挂载读取路径)
-          ENV_FILE_PATH="/etc/caddy/env.conf"
+          # ⚠️ 环境变量配置文件路径 (已统一在顶部 env 中定义)
+          ENV_FILE_PATH="${{ env.ENV_FILE_PATH }}"
           
           # ⚠️ [Fix] 启动脚本：实现环境变量检测逻辑 + 10分钟等待
           cat <<EOF > entrypoint_ddns.sh
@@ -225,6 +250,14 @@ jobs:
           docker buildx build --platform linux/${{ matrix.arch }} -t caddy-ddns:latest --load -f Dockerfile.ddns .
           docker save -o caddy-ddns-docker-universal-${COMBINED_TAG}-${{ matrix.arch }}.tar caddy-ddns:latest
 
+          # ⚠️ 新增：推送到 GitHub Packages (GHCR)
+          REPO_LOWER=$(echo "${{ github.repository }}" | tr '[:upper:]' '[:lower:]')
+          DDNS_IMAGE="ghcr.io/$REPO_LOWER/caddy-ddns"
+          docker tag caddy-ddns:latest $DDNS_IMAGE:${COMBINED_TAG}-${{ matrix.arch }}
+          docker tag caddy-ddns:latest $DDNS_IMAGE:latest-${{ matrix.arch }}
+          docker push $DDNS_IMAGE:${COMBINED_TAG}-${{ matrix.arch }}
+          docker push $DDNS_IMAGE:latest-${{ matrix.arch }}
+
       # ----------------------------------------------------------------
       # 4. 上传 (文件精简为 3 类)
       # ----------------------------------------------------------------
@@ -242,11 +275,12 @@ jobs:
              
              ### 🛠️ 功能
              1. **ROS/Linux 通用化**: 所有 `.tar` 均可直接导入 RouterOS 7.x 或 `docker load`。
-             2. **智能网络等待**: DDNS 版镜像支持通过环境变量 `CHECK_MODE` 控制启动等待逻辑。
+             2. **GitHub Packages 支持**: 镜像已同步推送至 `ghcr.io`，支持直接 `docker pull` 拉取 (按对应架构)。
+             3. **智能网络等待**: DDNS 版镜像支持通过环境变量 `CHECK_MODE` 控制启动等待逻辑。
                 - `CHECK_MODE=ipv6` : 等待 IPv6 Global 地址 (推荐 ROS 用户)
                 - `CHECK_MODE=ipv4` : 等待 IPv4 地址
                 - `CHECK_MODE=auto` : 任意 IP 即启动 (默认)
-             3. **文件读取 Token 特性**: 镜像启动时会自动检测并读取 `/etc/caddy/env.conf` 文件（若存在），支持将含有高敏感信息（如 Cloudflare Token）的环境变量文件进行挂载引用，完美兼容原有环境变量部署方式。
+             4. **文件读取 Token 特性**: 镜像启动时会自动检测并读取 `${{ env.ENV_FILE_PATH }}` 文件（若存在），支持将含有高敏感信息（如 Cloudflare Token）的环境变量文件进行挂载引用，完美兼容原有环境变量部署方式。
              
              ### 📂 文件列表
              1. `caddy-linux-v...` : 二进制文件
