@@ -1,4 +1,5 @@
 name: Build-Caddy&cloudflare
+
 on:
   workflow_dispatch:
   schedule:
@@ -81,6 +82,27 @@ jobs:
       - name: Build & Export (Legacy Mode)
         run: |
           VERSION="${{ needs.check-version.outputs.version }}"
+          
+          # ⚠️ 环境变量配置文件路径 (你可以随时修改这个变量改变挂载读取路径)
+          ENV_FILE_PATH="/etc/caddy/.env"
+          
+          # 动态注入环境变量挂载支持脚本
+          cat <<EOF > entrypoint_wrapper.sh
+          #!/bin/sh
+          if [ -f "$ENV_FILE_PATH" ]; then
+              echo ">>> [Init] Loading env file from $ENV_FILE_PATH"
+              set -a
+              . "$ENV_FILE_PATH"
+              set +a
+          fi
+          # 默认执行 Caddy
+          exec caddy run --config /etc/caddy/Caddyfile --adapter caddyfile
+          EOF
+          chmod +x entrypoint_wrapper.sh
+          
+          # 动态修改源码库中的 Dockerfile 以加载 wrapper
+          echo "COPY entrypoint_wrapper.sh /entrypoint.sh" >> docker/caddy-plugins/Dockerfile
+          echo 'ENTRYPOINT ["/entrypoint.sh"]' >> docker/caddy-plugins/Dockerfile
           
           # Load 到 Docker Daemon 进行格式清洗
           docker buildx build \
