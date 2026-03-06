@@ -1,0 +1,184 @@
+name: Build-Phantun-
+
+on:
+  workflow_dispatch:
+
+env:
+  APP_NAME: "phantun"
+  APP_VERSION: "0.8.1"
+  FILE_PREFIX: "phantun-linux"
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    name: Build ${{ matrix.arch_label }}
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch_label: amd64
+            platform: linux/amd64
+          - arch_label: arm64
+            platform: linux/arm64
+          - arch_label: arm
+            platform: linux/arm/v7
+
+    steps:
+      - name: Checkout official source
+        uses: actions/checkout@v4
+        with:
+          repository: dndx/phantun
+          ref: v${{ env.APP_VERSION }}
+          fetch-depth: 1
+
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@v3
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Generate Dockerfile
+        shell: bash
+        run: |
+          cat > Dockerfile.alpine <<'EOF'
+          # ==========================================================
+          # Builder stage
+          # 说明：
+          # - 不做奇怪压缩，不用 UPX
+          # - 用官方源码 + Cargo.lock 复现
+          # - LTO + 单 codegen unit：兼顾体积与性能
+          # ==========================================================
+          FROM rust:1.81-alpine3.20 AS builder
+
+          WORKDIR /src
+
+          ENV CARGO_PROFILE_RELEASE_LTO=fat \
+              CARGO_PROFILE_RELEASE_CODEGEN_UNITS=1 \
+              CARGO_NET_GIT_FETCH_WITH_CLI=true
+
+          RUN apk add --no-cache musl-dev binutils
+
+          COPY . .
+
+          RUN cargo build --release --locked --bins
+
+          RUN strip target/release/client target/release/server || true
+
+          # ==========================================================
+          # Runtime stage
+          # 说明：
+          # - 继续用 Alpine，兼顾体积与 RouterOS 导入兼容性
+          # - 不装 tzdata / ca-certificates，Phantun 本身不需要
+          # - 保持你现有环境变量接口不变
+          # ==========================================================
+          FROM alpine:3.20
+
+          COPY --from=builder /src/target/release/client /usr/local/bin/phantun-client
+          COPY --from=builder /src/target/release/server /usr/local/bin/phantun-server
+
+          RUN cat > /usr/local/bin/docker-entrypoint.sh <<'SH' && chmod +x /usr/local/bin/docker-entrypoint.sh
+          #!/bin/sh
+          set -eu
+
+          MODE="${RUN_MODE:-client}"
+          LOCAL="${LOCAL_ADDR:-}"
+          REMOTE="${REMOTE_ADDR:-}"
+
+          if [ -z "$LOCAL" ]; then
+            echo "Error: LOCAL_ADDR missing"
+            exit 1
+          fi
+
+          if [ -z "$REMOTE" ]; then
+            echo "Error: REMOTE_ADDR missing"
+            exit 1
+          fi
+
+          EXEC_BIN="/usr/local/bin/phantun-client"
+          if [ "$MODE" = "server" ]; then
+            EXEC_BIN="/usr/local/bin/phantun-server"
+          fi
+
+          EXTRA_ARGS=""
+
+          # 保持你的环境变量名不变，只修正映射到官方正确 CLI 参数
+          if [ -n "${TUN_NAME:-}" ]; then
+            EXTRA_ARGS="$EXTRA_ARGS --tun ${TUN_NAME}"
+          fi
+
+          if [ -n "${TUN_LOCAL:-}" ]; then
+            EXTRA_ARGS="$EXTRA_ARGS --tun-local ${TUN_LOCAL}"
+          fi
+
+          if [ -n "${TUN_PEER:-}" ]; then
+            EXTRA_ARGS="$EXTRA_ARGS --tun-peer ${TUN_PEER}"
+          fi
+
+          echo "Starting Phantun: ${MODE}"
+          # shellcheck disable=SC2086
+          exec "$EXEC_BIN" --local "$LOCAL" --remote "$REMOTE" $EXTRA_ARGS "$@"
+          SH
+
+          ENV RUN_MODE="client" \
+              LOCAL_ADDR="" \
+              REMOTE_ADDR="" \
+              TUN_NAME="" \
+              TUN_LOCAL="" \
+              TUN_PEER=""
+
+          ENTRYPOINT ["/usr/local/bin/docker-entrypoint.sh"]
+          EOF
+
+      - name: Build docker-archive tar for RouterOS import
+        shell: bash
+        run: |
+          FILENAME="${{ env.FILE_PREFIX }}-${{ env.APP_VERSION }}-${{ matrix.arch_label }}.tar"
+
+          docker buildx build \
+            --platform "${{ matrix.platform }}" \
+            --provenance=false \
+            --sbom=false \
+            --output "type=docker,dest=${FILENAME}" \
+            -f Dockerfile.alpine \
+            .
+
+          ls -lh "${FILENAME}"
+          echo "Generated ${FILENAME}"
+
+      - name: Upload workflow artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ env.FILE_PREFIX }}-${{ env.APP_VERSION }}-${{ matrix.arch_label }}
+          path: ${{ env.FILE_PREFIX }}-${{ env.APP_VERSION }}-${{ matrix.arch_label }}.tar
+          if-no-files-found: error
+
+  release:
+    name: Create GitHub Release
+    runs-on: ubuntu-latest
+    needs: build
+
+    steps:
+      - name: Download all built tars
+        uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: Show release files
+        shell: bash
+        run: |
+          ls -lh dist
+
+      - name: Publish release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: v${{ env.APP_VERSION }}-ros${{ github.run_number }}
+          name: ${{ env.APP_NAME }} v${{ env.APP_VERSION }} (RouterOS manual import)
+          files: dist/*.tar
+          draft: false
+          prerelease: false
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
