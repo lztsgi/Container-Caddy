@@ -14,17 +14,36 @@ jobs:
     runs-on: ubuntu-latest
     outputs:
       ah_ver: ${{ steps.get_versions.outputs.ah_ver }}
+      need_build: ${{ steps.get_versions.outputs.need_build }}
     steps:
-      - name: Get Upstream Version
+      - name: Check Versions
         id: get_versions
         run: |
-          # 修复点：加入鉴权 Token 避免 GitHub API 匿名限流，并加入防空值检查
+          # 1. 获取官方上游最新版本
           AH_VER=$(curl -s -H "Authorization: Bearer ${{ secrets.GITHUB_TOKEN }}" https://api.github.com/repos/AdguardTeam/AdGuardHome/releases/latest | grep '"tag_name":' | sed -E 's/.*"([^"]+)".*/\1/')
-          if [ -z "$AH_VER" ]; then echo "Error: Failed to fetch AdGuardHome version!" && exit 1; fi
+          if [ -z "$AH_VER" ]; then echo "Error: Failed to fetch upstream version!" && exit 1; fi
+          
+          # 2. 获取你自己仓库当前已发布的最新版本
+          LOCAL_VER=$(curl -s -H "Authorization: Bearer ${{ secrets.GITHUB_TOKEN }}" https://api.github.com/repos/${{ github.repository }}/releases/latest | grep '"tag_name":' | sed -E 's/.*"([^"]+)".*/\1/')
+          
+          echo "Upstream AdGuardHome version: $AH_VER"
+          echo "Local built version: $LOCAL_VER"
+          
           echo "ah_ver=$AH_VER" >> $GITHUB_OUTPUT
+          
+          # 3. 版本号对比逻辑
+          if [ "$AH_VER" != "$LOCAL_VER" ]; then
+            echo "need_build=true" >> $GITHUB_OUTPUT
+            echo "版本不同，需要触发新构建。"
+          else
+            echo "need_build=false" >> $GITHUB_OUTPUT
+            echo "版本一致，跳过今日构建任务。"
+          fi
 
   build-and-release:
     needs: check-version
+    # ⚠️ 新增核心控制：仅当判定需要构建，或者用户手动在网页端点击"Run workflow"时才执行
+    if: needs.check-version.outputs.need_build == 'true' || github.event_name == 'workflow_dispatch'
     name: Build ${{ matrix.arch }}
     runs-on: ubuntu-latest
     strategy:
@@ -34,7 +53,6 @@ jobs:
             ah_arch: amd64
           - arch: arm64
             ah_arch: arm64
-
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
