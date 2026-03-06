@@ -1,4 +1,4 @@
-name: Build-Phantun-
+name: Build-Phantun-test
 
 on:
   workflow_dispatch:
